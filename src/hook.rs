@@ -112,9 +112,10 @@ fn target_end(command: &str, start: usize, brackets: bool, powershell: bool) -> 
     (depth == 0).then_some(command.len())
 }
 
-fn gated_targets(command: &str, powershell: bool) -> (Vec<String>, String) {
+fn gated_targets(command: &str, powershell: bool) -> (Vec<String>, String, Vec<(usize, usize)>) {
     let re = gate_prefix();
     let mut targets = Vec::new();
+    let mut ranges = Vec::new();
     let mut outside = String::new();
     let mut from = 0;
     while let Some(m) = re.find_at(command, from) {
@@ -126,10 +127,11 @@ fn gated_targets(command: &str, powershell: bool) -> (Vec<String>, String) {
         outside.push_str(&command[from..m.start()]);
         outside.push_str("; ");
         targets.push(command[m.end()..end].to_string());
+        ranges.push((m.start(), end));
         from = end;
     }
     outside.push_str(&command[from..]);
-    (targets, outside)
+    (targets, outside, ranges)
 }
 
 /// Blanks text that is data rather than commands, so it cannot look like a command start:
@@ -137,14 +139,35 @@ fn gated_targets(command: &str, powershell: bool) -> (Vec<String>, String) {
 /// is the program itself (`& "C:\...\cargo.exe" build`) or the body of `-c`/`-Command`/`/c`.
 /// `powershell` says which shell reads `command`: there a quoted string at a command start is a
 /// program only after the call operator (`"make sure ..."` just prints), while Bash and cmd run it.
-fn mask_data(command: &str, powershell: bool) -> String {
-    mask_data_inner(&command.replace("\r\n", "\n"), powershell, 0)
+struct Masked {
+    /// The command with CRLF line ends normalized.
+    text: String,
+    /// `text` with data blanked and nested bodies marked.
+    visible: String,
+    /// For each byte of `visible`, the byte of `text` it stands for.
+    origin: Vec<usize>,
 }
 
-fn mask_data_inner(command: &str, powershell: bool, depth: usize) -> String {
+fn mask_data(command: &str, powershell: bool) -> Masked {
+    let text = command.replace("\r\n", "\n");
+    let (visible, origin) = mask_data_inner(&text, powershell, 0);
+    Masked {
+        text,
+        visible,
+        origin,
+    }
+}
+
+/// Appends `s` to the masked text, recording that its bytes stand for source byte `from`.
+fn emit(out: &mut String, origin: &mut Vec<usize>, s: &str, from: usize) {
+    out.push_str(s);
+    origin.resize(out.len(), from);
+}
+
+fn mask_data_inner(command: &str, powershell: bool, depth: usize) -> (String, Vec<usize>) {
     // Unusually deep shell nesting is outside this heuristic parser's contract.
     if depth >= 32 {
-        return String::new();
+        return (String::new(), Vec::new());
     }
     // `<<<` is a here-string (one word of data), not a heredoc with a body.
     let heredoc = Regex::new(r#"(?:^|[^<])<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?"#)
@@ -176,8 +199,16 @@ fn mask_data_inner(command: &str, powershell: bool, depth: usize) -> String {
     }
 
     let chars: Vec<char> = text.chars().collect();
+    // Byte offset of each char, plus the end.
+    let at: Vec<usize> = text
+        .char_indices()
+        .map(|(b, _)| b)
+        .chain(std::iter::once(text.len()))
+        .collect();
     let gate = gate_prefix();
     let mut out = String::with_capacity(text.len());
+    let mut origin = Vec::with_capacity(text.len());
+    let mut buf = [0_u8; 4];
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
@@ -192,7 +223,7 @@ fn mask_data_inner(command: &str, powershell: bool, depth: usize) -> String {
             let len = rest.find(&close).map_or(rest.chars().count(), |b| {
                 rest[..b + close.len()].chars().count()
             });
-            out.push_str("@''@");
+            emit(&mut out, &mut origin, "@''@", at[i]);
             i += len;
             continue;
         }
@@ -204,7 +235,9 @@ fn mask_data_inner(command: &str, powershell: bool, depth: usize) -> String {
                 }
                 j += 1;
             }
-            let segment: String = chars[i..j.min(chars.len() - 1) + 1].iter().collect();
+            let last = j.min(chars.len() - 1);
+            let close = at[j.min(chars.len())];
+            let segment: String = chars[i..last + 1].iter().collect();
             let before = out.trim_end();
             let lower = before.to_ascii_lowercase();
             let wrapped_program = gate.find_iter(&out).any(|m| m.end() == out.len());
@@ -260,32 +293,41 @@ fn mask_data_inner(command: &str, powershell: bool, depth: usize) -> String {
                     .strip_prefix('"')
                     .and_then(|b| b.strip_suffix('"'))
                     .unwrap_or(body);
-                out.push_str("\u{1e}; ");
-                out.push_str(&mask_data_inner(inner, false, depth + 1));
-                out.push_str(" ;\u{1f}");
+                let base = at[i] + usize::from(inner.len() != body.len());
+                emit(&mut out, &mut origin, "\u{1e}; ", at[i]);
+                let (masked, from) = mask_data_inner(inner, false, depth + 1);
+                out.push_str(&masked);
+                origin.extend(from.iter().map(|o| o + base));
+                emit(&mut out, &mut origin, " ;\u{1f}", at[line_end]);
                 i = line_end;
                 continue;
             }
             if script {
                 // The body is itself a command line, read by the shell the flag belongs to: open it as a
                 // new command.
-                let inner = segment.trim_start_matches(c).trim_end_matches(c);
-                out.push_str("\u{1e}; ");
-                out.push_str(&mask_data_inner(inner, inner_powershell, depth + 1));
-                out.push_str(" ;\u{1f}");
+                let opened = segment.trim_start_matches(c);
+                let inner = opened.trim_end_matches(c);
+                let base = at[i] + (segment.len() - opened.len());
+                emit(&mut out, &mut origin, "\u{1e}; ", at[i]);
+                let (masked, from) = mask_data_inner(inner, inner_powershell, depth + 1);
+                out.push_str(&masked);
+                origin.extend(from.iter().map(|o| o + base));
+                emit(&mut out, &mut origin, " ;\u{1f}", close);
             } else if program {
-                out.push_str(&segment);
+                for k in i..last + 1 {
+                    emit(&mut out, &mut origin, chars[k].encode_utf8(&mut buf), at[k]);
+                }
             } else {
-                out.push(c);
-                out.push(c);
+                emit(&mut out, &mut origin, c.encode_utf8(&mut buf), at[i]);
+                emit(&mut out, &mut origin, c.encode_utf8(&mut buf), close);
             }
             i = j + 1;
             continue;
         }
-        out.push(c);
+        emit(&mut out, &mut origin, c.encode_utf8(&mut buf), at[i]);
         i += 1;
     }
-    out
+    (out, origin)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -309,18 +351,17 @@ pub fn judge(cfg: &Config, command: &str, is_subagent: bool, powershell: bool) -
             None => Verdict::Pass,
         };
     }
-    let visible = mask_data(command, powershell);
-    let (targets, outside) = gated_targets(&visible, powershell);
+    let masked = mask_data(command, powershell);
+    let (targets, outside, ranges) = gated_targets(&masked.visible, powershell);
+    let heavy_re = compile(HEAVY_PROGRAMS, &cfg.hook.extra_heavy_programs);
     let build = first_run(&build_re, &outside);
-    let heavy = first_run(
-        &compile(HEAVY_PROGRAMS, &cfg.hook.extra_heavy_programs),
-        &outside,
-    );
+    let heavy = first_run(&heavy_re, &outside);
     let wrapped_build = targets.iter().find_map(|t| first_run(&build_re, t));
 
     if is_subagent && cfg.subagent_builds == "deny" && (build.is_some() || wrapped_build.is_some())
     {
-        let what = command_span(command, &build.or(wrapped_build).unwrap_or_default());
+        let what = span_at(&masked, &build_re, &ranges, build.is_none())
+            .unwrap_or_else(|| command_span(command, &build.or(wrapped_build).unwrap_or_default()));
         return Verdict::Deny(format!(
             "The configured policy is that subagents do not build, compile, or run test builds. \
              Blocked: `{what}`. Finish your edits and hand the exact command back to the lead, \
@@ -330,7 +371,13 @@ pub fn judge(cfg: &Config, command: &str, is_subagent: bool, powershell: bool) -
     if build.is_none() && heavy.is_none() {
         return Verdict::Pass;
     }
-    let what = command_span(command, &build.or(heavy).unwrap_or_default());
+    let re = if build.is_some() {
+        &build_re
+    } else {
+        &heavy_re
+    };
+    let what = span_at(&masked, re, &ranges, false)
+        .unwrap_or_else(|| command_span(command, &build.or(heavy).unwrap_or_default()));
     let wrapped = wrapped_form(&what);
     let heavy_path = std::env::current_exe()
         .map(|p| p.display().to_string())
@@ -361,9 +408,65 @@ fn is_separator(text: &str, i: usize, ch: char) -> bool {
     }
 }
 
+/// The blocked simple command with its prefixes, arguments and quoting, located by position in
+/// the masked text (where data is blanked and nested bodies are marked) and cut from the
+/// original through the mask's byte origins. `inside` selects a match inside an already
+/// wrapped target rather than outside all of them. `None` when no such match exists.
+fn span_at(masked: &Masked, re: &Regex, ranges: &[(usize, usize)], inside: bool) -> Option<String> {
+    let visible = masked.visible.as_str();
+    let prefix = prefix_regex();
+    let keywords =
+        Regex::new(r"^(?:(?:then|do|else|elif|if|while|until|!)\s+)+").expect("keyword regex");
+    let lead = |c: char| c.is_whitespace() || ";|&(){}`\u{1e}\u{1f}".contains(c);
+    for m in re.find_iter(visible) {
+        let found = m.as_str();
+        let start = m.start() + (found.len() - found.trim_start_matches(lead).len());
+        let core = start + prefix.find(&visible[start..m.end()]).map_or(0, |p| p.end());
+        if ranges.iter().any(|&(a, b)| (a..b).contains(&core)) != inside {
+            continue;
+        }
+        // The exemption `first_run` makes.
+        let next = visible[m.end()..]
+            .split(|c: char| c.is_whitespace() || ";&|".contains(c))
+            .find(|t| !t.is_empty())
+            .unwrap_or("");
+        if ["--version", "-V", "-vV", "--help", "-h", "/?"].contains(&next) {
+            continue;
+        }
+        let mut end = visible.len();
+        let mut i = core;
+        while let Some(ch) = visible[i..].chars().next() {
+            if ch == '\'' || ch == '"' {
+                // A quote left in the masked text is a whole argument: skip to its partner.
+                match visible[i + 1..].find(ch) {
+                    Some(p) => {
+                        i += p + 2;
+                        continue;
+                    }
+                    None => {
+                        end = i;
+                        break;
+                    }
+                }
+            }
+            if ch == '\u{1e}' || ch == '\u{1f}' || is_separator(visible, i, ch) {
+                end = i;
+                break;
+            }
+            i += ch.len_utf8();
+        }
+        let from = *masked.origin.get(start)?;
+        let to = masked.origin.get(end).copied().unwrap_or(masked.text.len());
+        let span = masked.text.get(from..to)?.trim();
+        return Some(keywords.replace(span, "").into_owned());
+    }
+    None
+}
+
 /// The whole simple command that the classifier matched, with its prefixes, arguments and
-/// quoting, taken from the original text. The match comes from masked text, so it is located
-/// again here: the first occurrence in command position outside quotes, otherwise the first in
+/// quoting, taken from the original text: the fallback when `span_at` finds no match. The match
+/// comes from masked text, so it is located again here: the first occurrence in command position
+/// outside quotes, otherwise the first in
 /// command position inside a quoted body (`bash -c '...'`, where an already wrapped occurrence
 /// is not in command position), otherwise the first anywhere. Falls back to the match itself.
 fn command_span(command: &str, found: &str) -> String {

@@ -159,7 +159,7 @@ Place `run` options before the program. `--` ends option parsing. `--max-wait` l
 | Child's exit code | The child started and exited normally. |
 | `128 + signal` | On Unix, the child terminated by a signal, or the wrapper got `SIGINT`, `SIGTERM`, or `SIGHUP` while waiting for admission and never started it. On Windows, Ctrl+C while waiting returns 130. |
 | `75` | Admission timed out. |
-| `127` | The child could not be started, or on Windows could not be placed in its cleanup job. |
+| `127` | The child could not be started, or on Windows the wrapper could not join its cleanup job, so the command was not started. |
 | `2` | Invalid CLI usage. |
 | `1` | A state, slot, signal-handler, initialization, or child-wait operation failed. `config` also returns 1 when the file has problems. |
 

@@ -627,6 +627,21 @@ fn deny_names_the_exact_wrapped_command() {
             false,
             "heavy run -- make -j4",
         ),
+        (
+            "bash -c 'echo \"x; make a\"; make b'",
+            false,
+            "heavy run -- make b",
+        ),
+        (
+            "echo 'make' && bash -c 'make x'",
+            false,
+            "heavy run -- make x",
+        ),
+        (
+            "bash -c 'make a' && bash -c 'make b'",
+            false,
+            "heavy run -- make a",
+        ),
         ("if true; then make all; fi", false, "heavy run -- make all"),
         (
             "X=1 time cargo build -j2",
