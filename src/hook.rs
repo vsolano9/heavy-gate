@@ -363,8 +363,9 @@ fn is_separator(text: &str, i: usize, ch: char) -> bool {
 
 /// The whole simple command that the classifier matched, with its prefixes, arguments and
 /// quoting, taken from the original text. The match comes from masked text, so it is located
-/// again here: the first occurrence in command position outside quotes, otherwise (a body
-/// inside `bash -c '...'`) the first occurrence anywhere. Falls back to the match itself.
+/// again here: the first occurrence in command position outside quotes, otherwise the first in
+/// command position inside a quoted body (`bash -c '...'`, where an already wrapped occurrence
+/// is not in command position), otherwise the first anywhere. Falls back to the match itself.
 fn command_span(command: &str, found: &str) -> String {
     let text = command.replace("\r\n", "\n");
     let prefix = prefix_regex();
@@ -381,17 +382,25 @@ fn command_span(command: &str, found: &str) -> String {
     let mut quote: Option<char> = None;
     let mut prev = '\0';
     let mut command_start = 0;
+    // Where the current command starts inside a quoted body: after its opening quote or the
+    // last separator in it.
+    let mut body_start = 0;
     let mut located = None;
+    let mut in_body = None;
     let mut fallback = None;
+    let in_position = |leading: &str| {
+        prefix
+            .find(leading)
+            .is_some_and(|m| m.end() == leading.len())
+    };
     for (i, ch) in text.char_indices() {
         if text[i..].starts_with(core) && at_word(i) {
-            let leading = &text[command_start..i];
-            let in_position = prefix
-                .find(leading)
-                .is_some_and(|m| m.end() == leading.len());
-            if quote.is_none() && in_position {
+            if quote.is_none() && in_position(&text[command_start..i]) {
                 located = Some((command_start, i));
                 break;
+            }
+            if quote.is_some() && in_body.is_none() && in_position(&text[body_start..i]) {
+                in_body = Some((body_start, i));
             }
             fallback.get_or_insert((i, i));
         }
@@ -399,15 +408,20 @@ fn command_span(command: &str, found: &str) -> String {
             Some(q) => {
                 if ch == q && !(q == '"' && (prev == '\\' || prev == '`')) {
                     quote = None;
+                } else if is_separator(&text, i, ch) {
+                    body_start = i + ch.len_utf8();
                 }
             }
-            None if ch == '\'' || ch == '"' => quote = Some(ch),
+            None if ch == '\'' || ch == '"' => {
+                quote = Some(ch);
+                body_start = i + ch.len_utf8();
+            }
             None if is_separator(&text, i, ch) => command_start = i + ch.len_utf8(),
             None => {}
         }
         prev = ch;
     }
-    let Some((start, core_at)) = located.or(fallback) else {
+    let Some((start, core_at)) = located.or(in_body).or(fallback) else {
         return found.to_string();
     };
     let mut quote = None;

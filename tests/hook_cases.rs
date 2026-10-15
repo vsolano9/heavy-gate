@@ -617,6 +617,16 @@ fn deny_names_the_exact_wrapped_command() {
             false,
             "heavy run -- cargo build --locked",
         ),
+        (
+            "bash -c 'heavy run -- make first; make second'",
+            false,
+            "heavy run -- make second",
+        ),
+        (
+            "bash -c \"echo make; make -j4\"",
+            false,
+            "heavy run -- make -j4",
+        ),
         ("if true; then make all; fi", false, "heavy run -- make all"),
         (
             "X=1 time cargo build -j2",

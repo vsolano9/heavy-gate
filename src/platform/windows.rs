@@ -1,18 +1,10 @@
 use std::ffi::c_void;
 use std::io;
-use std::os::windows::io::AsRawHandle;
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use windows_sys::Win32::Foundation::{
-    CloseHandle, BOOL, ERROR_ACCESS_DENIED, HANDLE, INVALID_HANDLE_VALUE, WAIT_ABANDONED,
-    WAIT_OBJECT_0,
-};
+use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT};
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
-};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -20,8 +12,7 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::{
-    CreateMutexW, GetCurrentProcess, OpenThread, ReleaseMutex, ResumeThread, WaitForSingleObject,
-    CREATE_BREAKAWAY_FROM_JOB, CREATE_SUSPENDED, THREAD_SUSPEND_RESUME,
+    CreateMutexW, GetCurrentProcess, ReleaseMutex, WaitForSingleObject,
 };
 
 pub(crate) struct Slot {
@@ -212,98 +203,32 @@ pub(crate) fn command(program: &str) -> Command {
     Command::new(resolve_program(program))
 }
 
-/// Resume every thread of a process started with `CREATE_SUSPENDED`.
-/// Resumes every thread of a process started with `CREATE_SUSPENDED`.
-fn resume_threads(pid: u32) -> io::Result<()> {
-    // SAFETY: a thread snapshot of the whole system; the handle is closed below.
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: zero is valid initialization; dwSize is set before use.
-    let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
-    entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
-    let mut resumed = 0;
-    let mut failure = None;
-    // SAFETY: snapshot is valid and entry is writable with its size set.
-    let mut more = unsafe { Thread32First(snapshot, &mut entry) } != 0;
-    while more && failure.is_none() {
-        if entry.th32OwnerProcessID == pid {
-            // SAFETY: OpenThread returns null or a handle closed right after use.
-            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
-            if thread.is_null() {
-                failure = Some(io::Error::last_os_error());
-            } else {
-                // SAFETY: thread is a live handle with suspend/resume access.
-                if unsafe { ResumeThread(thread) } == u32::MAX {
-                    failure = Some(io::Error::last_os_error());
-                } else {
-                    resumed += 1;
-                }
-                // SAFETY: thread was opened above.
-                unsafe { CloseHandle(thread) };
-            }
-        }
-        // SAFETY: as for Thread32First.
-        more = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
-    }
-    // SAFETY: snapshot was created above.
-    unsafe { CloseHandle(snapshot) };
-    match failure {
-        Some(error) => Err(error),
-        None if resumed == 0 => Err(io::Error::other("the suspended process has no threads")),
-        None => Ok(()),
-    }
-}
-
 pub(crate) fn run_child(mut command: Command, _signals: &Signals) -> io::Result<i32> {
     // Containment is part of the contract: without a job the command does not run at all.
     let job =
         Job::new().map_err(|e| io::Error::other(format!("cannot create the cleanup job: {e}")))?;
-    let mut fallback_job = None;
-    // Debug builds can force the fallback path to test it; release builds ignore the variable.
-    let force_fallback =
-        cfg!(debug_assertions) && std::env::var_os("HEAVY_GATE_TEST_JOB_FALLBACK").is_some();
+    // Debug builds can force the refusal path to test it; release builds ignore the variable.
+    let force_refusal =
+        cfg!(debug_assertions) && std::env::var_os("HEAVY_GATE_TEST_NO_JOB").is_some();
     // SAFETY: GetCurrentProcess returns a valid pseudo handle; job is live.
-    if !force_fallback && unsafe { AssignProcessToJobObject(job.0, GetCurrentProcess()) } != 0 {
-        // The child inherits membership before executing any code (Windows 8+ nested jobs).
-        // Do NOT close this handle in a destructor: closing it kills heavy itself before
-        // metadata cleanup, logging, or exit-code propagation. Keep the non-inheritable
-        // handle until process exit, when the OS closes it and kills remaining descendants.
-        std::mem::forget(job);
-    } else {
-        // heavy could not join the job (its host job refuses it). Start the child suspended so it
-        // runs no code, and starts no descendants, until it is inside the job. Ask it to break
-        // away from the host job first, which the host may allow even when it refuses nesting.
-        command.creation_flags(CREATE_SUSPENDED | CREATE_BREAKAWAY_FROM_JOB);
-        fallback_job = Some(job);
+    if force_refusal || unsafe { AssignProcessToJobObject(job.0, GetCurrentProcess()) } == 0 {
+        // heavy's own host job refuses the nested job. Placing the child afterwards would leave a
+        // window in which killing heavy orphans it, so the command does not start at all.
+        let error = if force_refusal {
+            io::Error::other("forced by HEAVY_GATE_TEST_NO_JOB")
+        } else {
+            io::Error::last_os_error()
+        };
+        return Err(io::Error::other(format!(
+            "cannot join the cleanup job, so the command was not started: {error}"
+        )));
     }
-    let mut child = match command.spawn() {
-        Err(e)
-            if fallback_job.is_some() && e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) =>
-        {
-            // The host job does not allow breakaway: stay in it and try to nest.
-            command.creation_flags(CREATE_SUSPENDED);
-            command.spawn()?
-        }
-        result => result?,
-    };
-    if let Some(job) = &fallback_job {
-        // SAFETY: child and job own valid handles throughout the call.
-        let placed =
-            if unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle() as HANDLE) } != 0 {
-                resume_threads(child.id())
-            } else {
-                Err(io::Error::last_os_error())
-            };
-        if let Err(error) = placed {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(io::Error::other(format!(
-                "cannot place the command in a cleanup job: {error}"
-            )));
-        }
-    }
+    // The child inherits membership before executing any code (Windows 8+ nested jobs).
+    // Do NOT close this handle in a destructor: closing it kills heavy itself before
+    // metadata cleanup, logging, or exit-code propagation. Keep the non-inheritable
+    // handle until process exit, when the OS closes it and kills remaining descendants.
+    std::mem::forget(job);
+    let mut child = command.spawn()?;
     let code = loop {
         match child.wait() {
             Ok(status) => break status.code().unwrap_or(1),
@@ -316,6 +241,5 @@ pub(crate) fn run_child(mut command: Command, _signals: &Signals) -> io::Result<
             }
         }
     };
-    drop(fallback_job);
     Ok(code)
 }

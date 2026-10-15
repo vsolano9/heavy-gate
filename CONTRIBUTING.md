@@ -31,7 +31,7 @@ heavy run -- cargo test
 
 Use an isolated temporary configuration and state directory for manual concurrency checks so existing users' runs are unaffected. Do not delete active lock files.
 
-For gate changes, check slot contention, memory-floor waiting, timeout without child start, child start failure, exit-code propagation, environment preservation, and release after normal and interrupted exits. Check platform lifecycle behavior on the relevant OS rather than inferring it from another OS's build. On Windows, a debug build run with `HEAVY_GATE_TEST_JOB_FALLBACK=1` takes the suspended-start path that runs when the wrapper cannot join its job. It exercises that code path, not a host job policy that refuses nesting or breakaway; release builds ignore the variable.
+For gate changes, check slot contention, memory-floor waiting, timeout without child start, child start failure, exit-code propagation, environment preservation, and release after normal and interrupted exits. Check platform lifecycle behavior on the relevant OS rather than inferring it from another OS's build. On Windows, a debug build run with `HEAVY_GATE_TEST_NO_JOB=1` takes the refusal path that runs when the wrapper cannot join its job (exit 127, the command not started). It exercises that code path, not a host job policy that refuses nesting; release builds ignore the variable.
 
 For configuration changes, inspect `heavy config`, create a fresh file with `heavy init`, verify overwrite refusal, and check invalid keys and values. Hook configuration errors must stay silent and fall back to defaults for the affected keys, as `run` does.
 
