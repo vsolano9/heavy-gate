@@ -159,7 +159,7 @@ fn mask_data(command: &str, powershell: bool) -> Masked {
 }
 
 /// The text a shell passes on for a double-quoted body, with, for each of its bytes, the byte
-/// of `raw` it came from: Bash drops the backslash in `\"`, `\\`, `\$` and `` \` ``; PowerShell
+/// of `raw` where its character or its escape starts: Bash drops the backslash in `\"`, `\\`, `\$` and `` \` ``; PowerShell
 /// drops the backtick before any character and reads `""` as one quote.
 fn unescape_body(raw: &str, powershell: bool) -> (String, Vec<usize>) {
     let mut text = String::with_capacity(raw.len());
@@ -171,10 +171,12 @@ fn unescape_body(raw: &str, powershell: bool) -> (String, Vec<usize>) {
             (true, '`', Some(_)) | (true, '"', Some(&(_, '"'))) => true,
             _ => false,
         };
-        let (at, ch) = if escaped {
-            chars.next().expect("peeked")
+        // An escaped character stands for its whole escape, so a span that ends at it stops
+        // before the escape character.
+        let ch = if escaped {
+            chars.next().expect("peeked").1
         } else {
-            (at, ch)
+            ch
         };
         text.push(ch);
         from.resize(text.len(), at);

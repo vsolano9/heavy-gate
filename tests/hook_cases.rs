@@ -733,6 +733,11 @@ fn deny_names_the_exact_wrapped_command() {
             "heavy run -- cargo build",
         ),
         ("time -p make x", false, "time -p heavy run -- make x"),
+        (
+            r#"bash -c "bash -c 'bash -c \"make deep\"'; make top""#,
+            false,
+            "heavy run -- make deep",
+        ),
     ] {
         let Verdict::Deny(reason) = judge(&cfg, command, false, powershell) else {
             panic!("{command}: expected a denial");
