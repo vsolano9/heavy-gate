@@ -15,7 +15,7 @@ use std::io::Read;
 
 /// Start of a command, plus PowerShell `&`, `cmd /c`, bash `VAR=x`, `env`/`time` prefixes and shell
 /// keywords that begin a command (`then`, `do`, `if`, ...), which count only after a separator.
-const START: &str = r#"(?:^|[\n;|&({`])\s*(?:&\s*)?(?:(?:then|do|else|elif|if|while|until|!|cmd(?:\.exe)?\s+//?[ck]|time(?:\s+-p)?|env(?:\s+(?:-i|-0|--ignore-environment|--null|-u\s*[^\s;|&(){}]+|--unset=[^\s;|&(){}]+|-C\s*[^\s;|&(){}]+|--chdir=[^\s;|&(){}]+))*|nohup|command|exec|nice(?:\s+(?:-n\s*-?\d+|-\d+|--adjustment=-?\d+))*|timeout(?:\s+(?:-[ks]\s*\S+|--[a-z-]+(?:=\S+)?|-[a-z]+))*\s+\d+(?:\.\d+)?[smhd]?|start(?:\s+/\w+)*|[A-Za-z_][A-Za-z0-9_]*=[^\s;|&(){}]*)\s+)*(?:['"][^'"\n]*[\\/]|['"]?(?:[^\s'";|&(){}]*[\\/])?)"#;
+const START: &str = r#"(?:^|[\n;|&({`])\s*(?:&\s*)?(?:(?:then|do|else|elif|if|while|until|!|cmd(?:\.exe)?\s+//?[ck]|time(?:\s+(?:-[pv]+|--[a-z-]+(?:=\S+)?|-[fo]\s*\S+))*|env(?:\s+(?:-i|-0|--|--ignore-environment|--null|-u\s*[^\s;|&(){}]+|--unset(?:=|\s+)[^\s;|&(){}]+|-C\s*[^\s;|&(){}]+|--chdir(?:=|\s+)[^\s;|&(){}]+))*|nohup|command(?:\s+-p)?|exec(?:\s+(?:-[cl]+|-a\s*[^\s;|&(){}]+))*|nice(?:\s+(?:-n\s*-?\d+|-\d+|--adjustment=-?\d+))*|timeout(?:\s+(?:-[ks]\s*\S+|--[a-z-]+(?:=\S+)?|-[a-z]+))*\s+\d+(?:\.\d+)?[smhd]?|start(?:\s+/\w+)*|[A-Za-z_][A-Za-z0-9_]*=[^\s;|&(){}]*)\s+)*(?:['"][^'"\n]*[\\/]|['"]?(?:[^\s'";|&(){}]*[\\/])?)"#;
 /// End of a program name: optional Windows extension, optional closing quote, then a separator.
 const END: &str = r#"(?:\.exe|\.cmd|\.bat)?['"]?(?:\s|$|[;|&)}`])"#;
 
@@ -158,17 +158,39 @@ fn mask_data(command: &str, powershell: bool) -> Masked {
     }
 }
 
-/// The text a shell passes on for a double-quoted body, with, for each of its bytes, the byte
-/// of `raw` where its character or its escape starts: Bash drops the backslash in `\"`, `\\`, `\$` and `` \` ``; PowerShell
-/// drops the backtick before any character and reads `""` as one quote.
-fn unescape_body(raw: &str, powershell: bool) -> (String, Vec<usize>) {
+/// Where the quoted piece opening at `i` closes (`chars.len()` when it never does). A backslash
+/// or backtick escapes the next character in double quotes; in PowerShell a doubled quote is
+/// one quote character.
+fn quoted_end(chars: &[char], i: usize, powershell: bool) -> usize {
+    let c = chars[i];
+    let mut j = i + 1;
+    while j < chars.len() {
+        let ch = chars[j];
+        let escape = c == '"' && (ch == '\\' || ch == '`');
+        if escape || (ch == c && powershell && chars.get(j + 1) == Some(&c)) {
+            j += 2;
+        } else if ch == c {
+            break;
+        } else {
+            j += 1;
+        }
+    }
+    j.min(chars.len())
+}
+
+/// The text a shell passes on for a quoted piece (`quote` is its quote character), with, for
+/// each of its bytes, the byte of `raw` where its character or its escape starts. In double
+/// quotes Bash drops the backslash in `\"`, `\\`, `\$` and `` \` ``, and PowerShell drops the
+/// backtick before any character; PowerShell reads a doubled quote as one in either kind.
+fn unescape_body(raw: &str, powershell: bool, quote: char) -> (String, Vec<usize>) {
     let mut text = String::with_capacity(raw.len());
     let mut from = Vec::with_capacity(raw.len());
     let mut chars = raw.char_indices().peekable();
     while let Some((at, ch)) = chars.next() {
         let escaped = match (powershell, ch, chars.peek()) {
-            (false, '\\', Some(&(_, next))) if "\"\\$`".contains(next) => true,
-            (true, '`', Some(_)) | (true, '"', Some(&(_, '"'))) => true,
+            (false, '\\', Some(&(_, next))) => quote == '"' && "\"\\$`".contains(next),
+            (true, '`', Some(_)) => quote == '"',
+            (true, _, Some(&(_, next))) => ch == quote && next == quote,
             _ => false,
         };
         // An escaped character stands for its whole escape, so a span that ends at it stops
@@ -209,9 +231,9 @@ fn mask_data_inner(command: &str, powershell: bool, depth: usize) -> (String, Ve
         let mut end = text.len();
         let mut pos = body_start;
         for line in text[body_start..].split_inclusive('\n') {
-            let line = line.trim();
-            if line == delimiter
-                || line
+            let word = line.trim();
+            if word == delimiter
+                || word
                     .strip_prefix(delimiter.as_str())
                     .is_some_and(|rest| rest.starts_with(['"', '\'']))
             {
@@ -259,19 +281,12 @@ fn mask_data_inner(command: &str, powershell: bool, depth: usize) -> (String, Ve
             continue;
         }
         if c == '\'' || c == '"' {
-            let mut j = i + 1;
-            while j < chars.len() && chars[j] != c {
-                if c == '"' && (chars[j] == '\\' || chars[j] == '`') {
-                    j += 1;
-                }
-                j += 1;
-            }
+            let j = quoted_end(&chars, i, powershell);
             let last = j.min(chars.len() - 1);
             let close = at[j.min(chars.len())];
-            let segment: String = chars[i..last + 1].iter().collect();
             // Only the text just before the quote decides what it is; a bounded window keeps
             // quote-heavy commands linear.
-            let mut tail_from = out.len().saturating_sub(4096);
+            let mut tail_from = out.trim_end().len().saturating_sub(4096);
             while !out.is_char_boundary(tail_from) {
                 tail_from -= 1;
             }
@@ -345,26 +360,33 @@ fn mask_data_inner(command: &str, powershell: bool, depth: usize) -> (String, Ve
             if script {
                 // The body is itself a command line, read by the shell the flag belongs to: open it as a
                 // new command.
-                let opened = &segment[c.len_utf8()..];
-                let raw = if j < chars.len() {
-                    &opened[..opened.len() - c.len_utf8()]
-                } else {
-                    opened
-                };
-                let base = at[i] + c.len_utf8();
-                let (inner, unescaped) = if c == '"' {
-                    unescape_body(raw, inner_powershell)
-                } else {
-                    (raw.to_string(), (0..raw.len()).collect())
-                };
+                let mut inner = String::new();
+                let mut source = Vec::new();
+                let (mut p, mut k) = (i, j);
+                loop {
+                    let q = chars[p];
+                    let start = at[p] + q.len_utf8();
+                    let (piece, from) = unescape_body(&text[start..at[k]], powershell, q);
+                    inner.push_str(&piece);
+                    source.extend(from.iter().map(|&o| start + o));
+                    if k + 1 < chars.len() && (chars[k + 1] == '\'' || chars[k + 1] == '"') {
+                        p = k + 1;
+                        k = quoted_end(&chars, p, powershell);
+                    } else {
+                        break;
+                    }
+                }
+                let close = at[k.min(chars.len())];
                 emit(&mut out, &mut origin, "\u{1e}; ", at[i]);
                 let (masked, from) = mask_data_inner(&inner, inner_powershell, depth + 1);
                 out.push_str(&masked);
                 origin.extend(
                     from.iter()
-                        .map(|&o| base + unescaped.get(o).copied().unwrap_or(raw.len())),
+                        .map(|&o| source.get(o).copied().unwrap_or(close)),
                 );
                 emit(&mut out, &mut origin, " ;\u{1f}", close);
+                i = k + 1;
+                continue;
             } else if program {
                 for k in i..last + 1 {
                     emit(&mut out, &mut origin, chars[k].encode_utf8(&mut buf), at[k]);
@@ -393,9 +415,28 @@ pub fn judge(cfg: &Config, command: &str, is_subagent: bool, powershell: bool) -
         return Verdict::Pass;
     }
     let build_re = compile(BUILD_PROGRAMS, &cfg.hook.extra_build_programs);
+    let heavy_re = compile(HEAVY_PROGRAMS, &cfg.hook.extra_heavy_programs);
+    let subagent_denied = is_subagent && cfg.subagent_builds == "deny";
     if command.len() > MAX_CLASSIFIED {
-        // Too large to parse: deny if a build appears anywhere rather than pass it unseen.
-        return match first_run(&build_re, command) {
+        // Too large to parse: deny if a build or heavy program starts any command in it, quoted or
+        // not, rather than pass it unseen. A subagent's build is denied even right after a wrapper.
+        if subagent_denied {
+            let wrapped = || {
+                gate_prefix()
+                    .find_iter(command)
+                    .take(64)
+                    .find_map(|m| first_run(&build_re, &command[m.end()..]))
+            };
+            if let Some(found) = first_run(&build_re, command).or_else(wrapped) {
+                return Verdict::Deny(format!(
+                    "The configured policy is that subagents do not build, compile, or run test builds. \
+                     This command is too large for the hook to classify and contains `{found}`. Finish \
+                     your edits and hand the exact command back to the lead, including what to check in \
+                     its output. The lead runs the build through the shared gate."
+                ));
+            }
+        }
+        return match first_run(&build_re, command).or_else(|| first_run(&heavy_re, command)) {
             Some(found) => Verdict::Deny(format!(
                 "Machine-wide memory rule: this command is too large for the hook to classify and \
                  contains `{found}`. Run the heavy part as its own command, prefixed by `heavy run -- `."
@@ -405,13 +446,11 @@ pub fn judge(cfg: &Config, command: &str, is_subagent: bool, powershell: bool) -
     }
     let masked = mask_data(command, powershell);
     let (targets, outside, ranges) = gated_targets(&masked.visible, powershell);
-    let heavy_re = compile(HEAVY_PROGRAMS, &cfg.hook.extra_heavy_programs);
     let build = first_run(&build_re, &outside);
     let heavy = first_run(&heavy_re, &outside);
     let wrapped_build = targets.iter().find_map(|t| first_run(&build_re, t));
 
-    if is_subagent && cfg.subagent_builds == "deny" && (build.is_some() || wrapped_build.is_some())
-    {
+    if subagent_denied && (build.is_some() || wrapped_build.is_some()) {
         let what = span_at(&masked, &build_re, &ranges, build.is_none())
             .unwrap_or_else(|| command_span(command, &build.or(wrapped_build).unwrap_or_default()));
         return Verdict::Deny(format!(
@@ -446,7 +485,7 @@ pub fn judge(cfg: &Config, command: &str, is_subagent: bool, powershell: bool) -
 /// `VAR=value` (quoted values allowed), `time`, `env`, `nice`, `timeout` and `start`.
 fn prefix_regex() -> Regex {
     Regex::new(
-        r#"(?i)^\s*(?:&\s*)?(?:(?:then|do|else|elif|if|while|until|!|cmd(?:\.exe)?\s+//?[ck]|time(?:\s+-p)?|env(?:\s+(?:-i|-0|--ignore-environment|--null|-u\s*[^\s;|&(){}]+|--unset=[^\s;|&(){}]+|-C\s*[^\s;|&(){}]+|--chdir=[^\s;|&(){}]+))*|nohup|command|exec|nice(?:\s+(?:-n\s*-?\d+|-\d+|--adjustment=-?\d+))*|timeout(?:\s+(?:-[ks]\s*\S+|--[a-z-]+(?:=\S+)?|-[a-z]+))*\s+\d+(?:\.\d+)?[smhd]?|start(?:\s+/\w+)*|[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;|&(){}'"])*)\s+)*"#,
+        r#"(?i)^\s*(?:&\s*)?(?:(?:then|do|else|elif|if|while|until|!|cmd(?:\.exe)?\s+//?[ck]|time(?:\s+(?:-[pv]+|--[a-z-]+(?:=\S+)?|-[fo]\s*\S+))*|env(?:\s+(?:-i|-0|--|--ignore-environment|--null|-u\s*[^\s;|&(){}]+|--unset(?:=|\s+)[^\s;|&(){}]+|-C\s*[^\s;|&(){}]+|--chdir(?:=|\s+)[^\s;|&(){}]+))*|nohup|command(?:\s+-p)?|exec(?:\s+(?:-[cl]+|-a\s*[^\s;|&(){}]+))*|nice(?:\s+(?:-n\s*-?\d+|-\d+|--adjustment=-?\d+))*|timeout(?:\s+(?:-[ks]\s*\S+|--[a-z-]+(?:=\S+)?|-[a-z]+))*\s+\d+(?:\.\d+)?[smhd]?|start(?:\s+/\w+)*|[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;|&(){}'"])*)\s+)*"#,
     )
     .expect("prefix regex")
 }

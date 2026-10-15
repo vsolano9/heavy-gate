@@ -456,6 +456,67 @@ fn shell_command_cases() {
         ("exec prefix", "exec cargo build", false, false, true),
         ("command -v lookup", "command -v make", false, false, false),
         (
+            "quote in a heredoc body",
+            "cat <<EOF\nx\n'\nEOF\nmake x",
+            false,
+            false,
+            true,
+        ),
+        (
+            "multibyte heredoc lines",
+            "cat <<EOF\ncafé\ncafé\nEOF\necho ok",
+            false,
+            false,
+            false,
+        ),
+        (
+            "indented heredoc lines then build",
+            "cat <<-EOF\n\t  a\n\t'b\n\tEOF\nmake x",
+            false,
+            false,
+            true,
+        ),
+        ("command -p prefix", "command -p make x", false, false, true),
+        ("exec -a prefix", "exec -a foo make x", false, false, true),
+        ("env -- prefix", "env -- make x", false, false, true),
+        ("time -v prefix", "time -v make x", false, false, true),
+        ("time -p data", "time -p echo make", false, false, false),
+        (
+            "env --chdir prefix",
+            "env --chdir /tmp make x",
+            false,
+            false,
+            true,
+        ),
+        (
+            "heredoc body inside a bash -c body is data",
+            "bash -c \"cat <<EOF\nmake a\nEOF\"",
+            false,
+            false,
+            false,
+        ),
+        (
+            "doubled quotes in a pwsh -Command body (PowerShell)",
+            r#"pwsh -Command "Write-Output ""hi""; cargo build""#,
+            true,
+            false,
+            true,
+        ),
+        (
+            "adjacent quoted pieces form one pwsh -Command body (Bash)",
+            r#"pwsh -Command "Write-Output ""hi""; cargo build""#,
+            false,
+            false,
+            true,
+        ),
+        (
+            "adjacent quoted data stays data",
+            r#"bash -c 'echo a'"'"'b'"'"' make'"#,
+            false,
+            false,
+            false,
+        ),
+        (
             "unbalanced brace in wrapped target",
             "heavy run -- echo { ; cargo build",
             false,
@@ -734,6 +795,16 @@ fn deny_names_the_exact_wrapped_command() {
         ),
         ("time -p make x", false, "time -p heavy run -- make x"),
         (
+            r#"pwsh -Command "Write-Output ""hi""; cargo build""#,
+            true,
+            "heavy run -- cargo build",
+        ),
+        (
+            r#"bash -c 'echo "it'"'"'s"; make x'"#,
+            false,
+            "heavy run -- make x",
+        ),
+        (
             r#"bash -c "bash -c 'bash -c \"make deep\"'; make top""#,
             false,
             "heavy run -- make deep",
@@ -761,4 +832,37 @@ fn subagent_denial_names_the_wrapped_build() {
         };
         assert!(reason.contains("Blocked: `make a`"), "{command}: {reason}");
     }
+}
+
+#[test]
+fn quoted_program_after_a_long_blank_run_is_a_program() {
+    let cfg = LoadedConfig::parse("unused.toml".into(), "").config;
+    for blank in [" ", "\n"] {
+        for prefix in ["", "echo ok;"] {
+            let command = format!("{prefix}{}\"make\" -j4", blank.repeat(5000));
+            assert!(
+                matches!(judge(&cfg, &command, false, false), Verdict::Deny(_)),
+                "{prefix:?} + 5000 x {blank:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn oversized_commands_keep_the_subagent_policy_and_heavy_programs() {
+    let mut cfg = LoadedConfig::parse("unused.toml".into(), "").config;
+    let pad = "a".repeat(1_572_864);
+    let wrapped = format!("heavy run -- cargo build {pad}");
+    let Verdict::Deny(reason) = judge(&cfg, &wrapped, true, false) else {
+        panic!("oversized wrapped subagent build passed");
+    };
+    assert!(reason.contains("subagents do not build"), "{reason}");
+    assert_eq!(judge(&cfg, &wrapped, false, false), Verdict::Pass);
+    let render = format!("blender --background x.blend {pad}");
+    assert!(matches!(
+        judge(&cfg, &render, false, false),
+        Verdict::Deny(_)
+    ));
+    cfg.subagent_builds = "gate".into();
+    assert_eq!(judge(&cfg, &wrapped, true, false), Verdict::Pass);
 }
