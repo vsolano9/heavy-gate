@@ -428,6 +428,34 @@ fn shell_command_cases() {
             false,
         ),
         (
+            "escaped quotes in a bash -c body",
+            r#"bash -c "echo \"a\"; make x""#,
+            false,
+            false,
+            true,
+        ),
+        (
+            "backtick-escaped quotes in a pwsh -Command body",
+            r#"pwsh -Command "Write-Output `"hi`"; cargo build""#,
+            true,
+            false,
+            true,
+        ),
+        (
+            "heredoc closed inside a bash -c body",
+            "bash -c \"cat <<EOF\nmake a\nEOF\" ; make b",
+            false,
+            false,
+            true,
+        ),
+        ("time -p prefix", "time -p make x", false, false, true),
+        ("env -i prefix", "env -i make x", false, false, true),
+        ("env -u prefix", "env -u FOO make x", false, false, true),
+        ("nohup prefix", "nohup make x", false, false, true),
+        ("command prefix", "command make x", false, false, true),
+        ("exec prefix", "exec cargo build", false, false, true),
+        ("command -v lookup", "command -v make", false, false, false),
+        (
             "unbalanced brace in wrapped target",
             "heavy run -- echo { ; cargo build",
             false,
@@ -684,6 +712,27 @@ fn deny_names_the_exact_wrapped_command() {
             "timeout 600 heavy run -- cargo build --release",
         ),
         ("echo `make -j2`", false, "heavy run -- make -j2"),
+        (
+            "cmd /c \"cargo build --release\"",
+            false,
+            "heavy run -- cargo build --release",
+        ),
+        (
+            "cmd /c \"cargo build\" && echo ok",
+            false,
+            "heavy run -- cargo build",
+        ),
+        (
+            r#"bash -c "echo \"a\"; make x""#,
+            false,
+            "heavy run -- make x",
+        ),
+        (
+            r#"pwsh -Command "Write-Output `"hi`"; cargo build""#,
+            true,
+            "heavy run -- cargo build",
+        ),
+        ("time -p make x", false, "time -p heavy run -- make x"),
     ] {
         let Verdict::Deny(reason) = judge(&cfg, command, false, powershell) else {
             panic!("{command}: expected a denial");
@@ -692,5 +741,19 @@ fn deny_names_the_exact_wrapped_command() {
             reason.contains(&format!("`{wrapped}`")),
             "{command}: {reason}"
         );
+    }
+}
+
+#[test]
+fn subagent_denial_names_the_wrapped_build() {
+    let cfg = LoadedConfig::parse("unused.toml".into(), "").config;
+    for command in [
+        "heavy run -- make a; make --version",
+        "heavy run -- make a | make --help",
+    ] {
+        let Verdict::Deny(reason) = judge(&cfg, command, true, false) else {
+            panic!("{command}: expected a denial");
+        };
+        assert!(reason.contains("Blocked: `make a`"), "{command}: {reason}");
     }
 }

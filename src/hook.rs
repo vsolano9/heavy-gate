@@ -15,7 +15,7 @@ use std::io::Read;
 
 /// Start of a command, plus PowerShell `&`, `cmd /c`, bash `VAR=x`, `env`/`time` prefixes and shell
 /// keywords that begin a command (`then`, `do`, `if`, ...), which count only after a separator.
-const START: &str = r#"(?:^|[\n;|&({`])\s*(?:&\s*)?(?:(?:then|do|else|elif|if|while|until|!|cmd(?:\.exe)?\s+//?[ck]|time|env|nice(?:\s+(?:-n\s*-?\d+|-\d+|--adjustment=-?\d+))*|timeout(?:\s+(?:-[ks]\s*\S+|--[a-z-]+(?:=\S+)?|-[a-z]+))*\s+\d+(?:\.\d+)?[smhd]?|start(?:\s+/\w+)*|[A-Za-z_][A-Za-z0-9_]*=[^\s;|&(){}]*)\s+)*(?:['"][^'"\n]*[\\/]|['"]?(?:[^\s'";|&(){}]*[\\/])?)"#;
+const START: &str = r#"(?:^|[\n;|&({`])\s*(?:&\s*)?(?:(?:then|do|else|elif|if|while|until|!|cmd(?:\.exe)?\s+//?[ck]|time(?:\s+-p)?|env(?:\s+(?:-i|-0|--ignore-environment|--null|-u\s*[^\s;|&(){}]+|--unset=[^\s;|&(){}]+|-C\s*[^\s;|&(){}]+|--chdir=[^\s;|&(){}]+))*|nohup|command|exec|nice(?:\s+(?:-n\s*-?\d+|-\d+|--adjustment=-?\d+))*|timeout(?:\s+(?:-[ks]\s*\S+|--[a-z-]+(?:=\S+)?|-[a-z]+))*\s+\d+(?:\.\d+)?[smhd]?|start(?:\s+/\w+)*|[A-Za-z_][A-Za-z0-9_]*=[^\s;|&(){}]*)\s+)*(?:['"][^'"\n]*[\\/]|['"]?(?:[^\s'";|&(){}]*[\\/])?)"#;
 /// End of a program name: optional Windows extension, optional closing quote, then a separator.
 const END: &str = r#"(?:\.exe|\.cmd|\.bat)?['"]?(?:\s|$|[;|&)}`])"#;
 
@@ -127,7 +127,7 @@ fn gated_targets(command: &str, powershell: bool) -> (Vec<String>, String, Vec<(
         outside.push_str(&command[from..m.start()]);
         outside.push_str("; ");
         targets.push(command[m.end()..end].to_string());
-        ranges.push((m.start(), end));
+        ranges.push((m.end(), end));
         from = end;
     }
     outside.push_str(&command[from..]);
@@ -158,6 +158,30 @@ fn mask_data(command: &str, powershell: bool) -> Masked {
     }
 }
 
+/// The text a shell passes on for a double-quoted body, with, for each of its bytes, the byte
+/// of `raw` it came from: Bash drops the backslash in `\"`, `\\`, `\$` and `` \` ``; PowerShell
+/// drops the backtick before any character and reads `""` as one quote.
+fn unescape_body(raw: &str, powershell: bool) -> (String, Vec<usize>) {
+    let mut text = String::with_capacity(raw.len());
+    let mut from = Vec::with_capacity(raw.len());
+    let mut chars = raw.char_indices().peekable();
+    while let Some((at, ch)) = chars.next() {
+        let escaped = match (powershell, ch, chars.peek()) {
+            (false, '\\', Some(&(_, next))) if "\"\\$`".contains(next) => true,
+            (true, '`', Some(_)) | (true, '"', Some(&(_, '"'))) => true,
+            _ => false,
+        };
+        let (at, ch) = if escaped {
+            chars.next().expect("peeked")
+        } else {
+            (at, ch)
+        };
+        text.push(ch);
+        from.resize(text.len(), at);
+    }
+    (text, from)
+}
+
 /// Appends `s` to the masked text, recording that its bytes stand for source byte `from`.
 fn emit(out: &mut String, origin: &mut Vec<usize>, s: &str, from: usize) {
     out.push_str(s);
@@ -183,7 +207,12 @@ fn mask_data_inner(command: &str, powershell: bool, depth: usize) -> (String, Ve
         let mut end = text.len();
         let mut pos = body_start;
         for line in text[body_start..].split_inclusive('\n') {
-            if line.trim() == delimiter {
+            let line = line.trim();
+            if line == delimiter
+                || line
+                    .strip_prefix(delimiter.as_str())
+                    .is_some_and(|rest| rest.starts_with(['"', '\'']))
+            {
                 end = pos;
                 break;
             }
@@ -238,14 +267,22 @@ fn mask_data_inner(command: &str, powershell: bool, depth: usize) -> (String, Ve
             let last = j.min(chars.len() - 1);
             let close = at[j.min(chars.len())];
             let segment: String = chars[i..last + 1].iter().collect();
-            let before = out.trim_end();
+            // Only the text just before the quote decides what it is; a bounded window keeps
+            // quote-heavy commands linear.
+            let mut tail_from = out.len().saturating_sub(4096);
+            while !out.is_char_boundary(tail_from) {
+                tail_from -= 1;
+            }
+            let tail = &out[tail_from..];
+            let before = tail.trim_end();
             let lower = before.to_ascii_lowercase();
-            let wrapped_program = gate.find_iter(&out).any(|m| m.end() == out.len());
+            let wrapped_program = gate.find_iter(tail).any(|m| m.end() == tail.len());
             let program = wrapped_program
                 || if powershell {
                     before.ends_with('&') && !before.ends_with("&&")
                 } else {
-                    before.is_empty() || before.ends_with(|ch: char| ";|&({\n".contains(ch))
+                    (before.is_empty() && tail_from == 0)
+                        || before.ends_with(|ch: char| ";|&({\n".contains(ch))
                 };
             // cmd's /c and /k, spelled //c and //k in Git Bash so MSYS leaves them alone.
             let head = lower.rsplit_once(' ').map_or("", |(head, _)| head);
@@ -298,20 +335,33 @@ fn mask_data_inner(command: &str, powershell: bool, depth: usize) -> (String, Ve
                 let (masked, from) = mask_data_inner(inner, false, depth + 1);
                 out.push_str(&masked);
                 origin.extend(from.iter().map(|o| o + base));
-                emit(&mut out, &mut origin, " ;\u{1f}", at[line_end]);
+                let body_end = at[i] + body.len() - usize::from(inner.len() != body.len());
+                emit(&mut out, &mut origin, " ;\u{1f}", body_end);
                 i = line_end;
                 continue;
             }
             if script {
                 // The body is itself a command line, read by the shell the flag belongs to: open it as a
                 // new command.
-                let opened = segment.trim_start_matches(c);
-                let inner = opened.trim_end_matches(c);
-                let base = at[i] + (segment.len() - opened.len());
+                let opened = &segment[c.len_utf8()..];
+                let raw = if j < chars.len() {
+                    &opened[..opened.len() - c.len_utf8()]
+                } else {
+                    opened
+                };
+                let base = at[i] + c.len_utf8();
+                let (inner, unescaped) = if c == '"' {
+                    unescape_body(raw, inner_powershell)
+                } else {
+                    (raw.to_string(), (0..raw.len()).collect())
+                };
                 emit(&mut out, &mut origin, "\u{1e}; ", at[i]);
-                let (masked, from) = mask_data_inner(inner, inner_powershell, depth + 1);
+                let (masked, from) = mask_data_inner(&inner, inner_powershell, depth + 1);
                 out.push_str(&masked);
-                origin.extend(from.iter().map(|o| o + base));
+                origin.extend(
+                    from.iter()
+                        .map(|&o| base + unescaped.get(o).copied().unwrap_or(raw.len())),
+                );
                 emit(&mut out, &mut origin, " ;\u{1f}", close);
             } else if program {
                 for k in i..last + 1 {
@@ -394,7 +444,7 @@ pub fn judge(cfg: &Config, command: &str, is_subagent: bool, powershell: bool) -
 /// `VAR=value` (quoted values allowed), `time`, `env`, `nice`, `timeout` and `start`.
 fn prefix_regex() -> Regex {
     Regex::new(
-        r#"(?i)^\s*(?:&\s*)?(?:(?:then|do|else|elif|if|while|until|!|cmd(?:\.exe)?\s+//?[ck]|time|env|nice(?:\s+(?:-n\s*-?\d+|-\d+|--adjustment=-?\d+))*|timeout(?:\s+(?:-[ks]\s*\S+|--[a-z-]+(?:=\S+)?|-[a-z]+))*\s+\d+(?:\.\d+)?[smhd]?|start(?:\s+/\w+)*|[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;|&(){}'"])*)\s+)*"#,
+        r#"(?i)^\s*(?:&\s*)?(?:(?:then|do|else|elif|if|while|until|!|cmd(?:\.exe)?\s+//?[ck]|time(?:\s+-p)?|env(?:\s+(?:-i|-0|--ignore-environment|--null|-u\s*[^\s;|&(){}]+|--unset=[^\s;|&(){}]+|-C\s*[^\s;|&(){}]+|--chdir=[^\s;|&(){}]+))*|nohup|command|exec|nice(?:\s+(?:-n\s*-?\d+|-\d+|--adjustment=-?\d+))*|timeout(?:\s+(?:-[ks]\s*\S+|--[a-z-]+(?:=\S+)?|-[a-z]+))*\s+\d+(?:\.\d+)?[smhd]?|start(?:\s+/\w+)*|[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;|&(){}'"])*)\s+)*"#,
     )
     .expect("prefix regex")
 }
@@ -418,29 +468,48 @@ fn span_at(masked: &Masked, re: &Regex, ranges: &[(usize, usize)], inside: bool)
     let keywords =
         Regex::new(r"^(?:(?:then|do|else|elif|if|while|until|!)\s+)+").expect("keyword regex");
     let lead = |c: char| c.is_whitespace() || ";|&(){}`\u{1e}\u{1f}".contains(c);
-    for m in re.find_iter(visible) {
-        let found = m.as_str();
-        let start = m.start() + (found.len() - found.trim_start_matches(lead).len());
-        let core = start + prefix.find(&visible[start..m.end()]).map_or(0, |p| p.end());
-        if ranges.iter().any(|&(a, b)| (a..b).contains(&core)) != inside {
+    // Outside: the whole masked text, skipping matches in a wrapped target. Inside: each target.
+    let haystacks: Vec<(usize, usize)> = if inside {
+        ranges.to_vec()
+    } else {
+        vec![(0, visible.len())]
+    };
+    for (base, limit) in haystacks {
+        let Some(m) = re.find_iter(&visible[base..limit]).find_map(|m| {
+            let found = m.as_str();
+            let start = base + m.start() + (found.len() - found.trim_start_matches(lead).len());
+            let core = start
+                + prefix
+                    .find(&visible[start..base + m.end()])
+                    .map_or(0, |p| p.end());
+            let wrapped = ranges.iter().any(|&(a, b)| (a..b).contains(&core));
+            // The exemption `first_run` makes.
+            let next = visible[base + m.end()..]
+                .split(|c: char| c.is_whitespace() || ";&|".contains(c))
+                .find(|t| !t.is_empty())
+                .unwrap_or("");
+            let probe = ["--version", "-V", "-vV", "--help", "-h", "/?"].contains(&next);
+            (!probe && (inside || !wrapped)).then_some((start, core))
+        }) else {
             continue;
-        }
-        // The exemption `first_run` makes.
-        let next = visible[m.end()..]
-            .split(|c: char| c.is_whitespace() || ";&|".contains(c))
-            .find(|t| !t.is_empty())
-            .unwrap_or("");
-        if ["--version", "-V", "-vV", "--help", "-h", "/?"].contains(&next) {
-            continue;
-        }
-        let mut end = visible.len();
+        };
+        let (start, core) = m;
+        let mut end = limit;
         let mut i = core;
-        while let Some(ch) = visible[i..].chars().next() {
+        while i < limit {
+            let Some(ch) = visible[i..].chars().next() else {
+                break;
+            };
             if ch == '\'' || ch == '"' {
-                // A quote left in the masked text is a whole argument: skip to its partner.
-                match visible[i + 1..].find(ch) {
+                // A quote left in the masked text is a whole argument: skip to its partner. A
+                // lone quote opening the program is skipped.
+                match visible[i + 1..limit].find(ch) {
                     Some(p) => {
                         i += p + 2;
+                        continue;
+                    }
+                    None if i == core => {
+                        i += 1;
                         continue;
                     }
                     None => {
@@ -457,8 +526,11 @@ fn span_at(masked: &Masked, re: &Regex, ranges: &[(usize, usize)], inside: bool)
         }
         let from = *masked.origin.get(start)?;
         let to = masked.origin.get(end).copied().unwrap_or(masked.text.len());
-        let span = masked.text.get(from..to)?.trim();
-        return Some(keywords.replace(span, "").into_owned());
+        let span = masked.text.get(from..to.max(from))?.trim();
+        let span = keywords.replace(span, "").into_owned();
+        if !span.is_empty() {
+            return Some(span);
+        }
     }
     None
 }
