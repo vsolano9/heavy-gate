@@ -68,7 +68,7 @@ fn first_run(re: &Regex, command: &str) -> Option<String> {
         })
         .map(|m| {
             m.as_str()
-                .trim_matches(|c: char| c.is_whitespace() || ";|&(){}".contains(c))
+                .trim_matches(|c: char| c.is_whitespace() || ";|&(){}`".contains(c))
                 .to_string()
         })
 }

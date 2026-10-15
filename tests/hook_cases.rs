@@ -658,6 +658,7 @@ fn deny_names_the_exact_wrapped_command() {
             false,
             "timeout 600 heavy run -- cargo build --release",
         ),
+        ("echo `make -j2`", false, "heavy run -- make -j2"),
     ] {
         let Verdict::Deny(reason) = judge(&cfg, command, false, powershell) else {
             panic!("{command}: expected a denial");
