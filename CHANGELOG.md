@@ -14,7 +14,7 @@ First public version, developed from a gate previously used internally to coordi
 - RAM and CPU based defaults, user configuration, effective configuration output, and non-overwriting initialization.
 - `heavy run`, `status`, `config`, `init`, `check`, `hook`, `--help`, and `--version` commands, with `help` and `version` aliases.
 - Cargo and CMake parallelism hints that preserve existing environment overrides.
-- Windows Job Object containment (suspended start where the host forbids nested jobs) and Ctrl+C handling, Unix signal forwarding, and Linux direct-child parent-death signaling.
+- Windows Job Object containment (a suspended start when the wrapper cannot join the job) and Ctrl+C handling, Unix signal forwarding, and Linux direct-child parent-death signaling.
 - Local holder metadata and JSON Lines run records.
 - Optional Claude Code Bash and PowerShell hook, configurable additional programs, and subagent build policy.
 - Table-driven shell-classification contracts, TOML validation, and auto-sizing arithmetic checks.

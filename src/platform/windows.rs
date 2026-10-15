@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, BOOL, HANDLE, INVALID_HANDLE_VALUE, WAIT_ABANDONED, WAIT_OBJECT_0,
+    CloseHandle, BOOL, ERROR_ACCESS_DENIED, HANDLE, INVALID_HANDLE_VALUE, WAIT_ABANDONED,
+    WAIT_OBJECT_0,
 };
 use windows_sys::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -20,7 +21,7 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::{
     CreateMutexW, GetCurrentProcess, OpenThread, ReleaseMutex, ResumeThread, WaitForSingleObject,
-    CREATE_SUSPENDED, THREAD_SUSPEND_RESUME,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_SUSPENDED, THREAD_SUSPEND_RESUME,
 };
 
 pub(crate) struct Slot {
@@ -212,25 +213,31 @@ pub(crate) fn command(program: &str) -> Command {
 }
 
 /// Resume every thread of a process started with `CREATE_SUSPENDED`.
-fn resume_threads(pid: u32) -> bool {
+/// Resumes every thread of a process started with `CREATE_SUSPENDED`.
+fn resume_threads(pid: u32) -> io::Result<()> {
     // SAFETY: a thread snapshot of the whole system; the handle is closed below.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
-        return false;
+        return Err(io::Error::last_os_error());
     }
     // SAFETY: zero is valid initialization; dwSize is set before use.
     let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
     entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
     let mut resumed = 0;
+    let mut failure = None;
     // SAFETY: snapshot is valid and entry is writable with its size set.
     let mut more = unsafe { Thread32First(snapshot, &mut entry) } != 0;
-    while more {
+    while more && failure.is_none() {
         if entry.th32OwnerProcessID == pid {
             // SAFETY: OpenThread returns null or a handle closed right after use.
             let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
-            if !thread.is_null() {
+            if thread.is_null() {
+                failure = Some(io::Error::last_os_error());
+            } else {
                 // SAFETY: thread is a live handle with suspend/resume access.
-                if unsafe { ResumeThread(thread) } != u32::MAX {
+                if unsafe { ResumeThread(thread) } == u32::MAX {
+                    failure = Some(io::Error::last_os_error());
+                } else {
                     resumed += 1;
                 }
                 // SAFETY: thread was opened above.
@@ -242,7 +249,11 @@ fn resume_threads(pid: u32) -> bool {
     }
     // SAFETY: snapshot was created above.
     unsafe { CloseHandle(snapshot) };
-    resumed > 0
+    match failure {
+        Some(error) => Err(error),
+        None if resumed == 0 => Err(io::Error::other("the suspended process has no threads")),
+        None => Ok(()),
+    }
 }
 
 pub(crate) fn run_child(mut command: Command, _signals: &Signals) -> io::Result<i32> {
@@ -261,19 +272,31 @@ pub(crate) fn run_child(mut command: Command, _signals: &Signals) -> io::Result<
         // handle until process exit, when the OS closes it and kills remaining descendants.
         std::mem::forget(job);
     } else {
-        // Hosts whose job forbids nesting: start the child suspended so it runs no code (and
-        // starts no descendants) until it is inside the job.
-        command.creation_flags(CREATE_SUSPENDED);
+        // heavy could not join the job (its host job refuses it). Start the child suspended so it
+        // runs no code, and starts no descendants, until it is inside the job. Ask it to break
+        // away from the host job first, which the host may allow even when it refuses nesting.
+        command.creation_flags(CREATE_SUSPENDED | CREATE_BREAKAWAY_FROM_JOB);
         fallback_job = Some(job);
     }
-    let mut child = command.spawn()?;
+    let mut child = match command.spawn() {
+        Err(e)
+            if fallback_job.is_some() && e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) =>
+        {
+            // The host job does not allow breakaway: stay in it and try to nest.
+            command.creation_flags(CREATE_SUSPENDED);
+            command.spawn()?
+        }
+        result => result?,
+    };
     if let Some(job) = &fallback_job {
         // SAFETY: child and job own valid handles throughout the call.
-        let assigned =
-            unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle() as HANDLE) } != 0;
-        let resumed = assigned && resume_threads(child.id());
-        if !resumed {
-            let error = io::Error::last_os_error();
+        let placed =
+            if unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle() as HANDLE) } != 0 {
+                resume_threads(child.id())
+            } else {
+                Err(io::Error::last_os_error())
+            };
+        if let Err(error) = placed {
             let _ = child.kill();
             let _ = child.wait();
             return Err(io::Error::other(format!(

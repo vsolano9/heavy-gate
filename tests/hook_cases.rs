@@ -486,6 +486,36 @@ cargo build",
             true,
         ),
         (
+            "timeout prefix",
+            "timeout 600 cargo build",
+            false,
+            false,
+            true,
+        ),
+        (
+            "timeout options",
+            "timeout -k 5 10m make -j8",
+            false,
+            false,
+            true,
+        ),
+        ("nice with niceness", "nice -n 5 make", false, false, true),
+        ("backtick substitution", "echo `make`", false, false, true),
+        (
+            "timeout words as data",
+            "echo \"timeout 5 make\"",
+            false,
+            false,
+            false,
+        ),
+        (
+            "cmd timeout is not a prefix",
+            "timeout /t 5",
+            false,
+            false,
+            false,
+        ),
+        (
             "loop body build",
             "for f in a; do make; done",
             false,
@@ -592,6 +622,41 @@ fn deny_names_the_exact_wrapped_command() {
             "X=1 time cargo build -j2",
             false,
             "X=1 time heavy run -- cargo build -j2",
+        ),
+        (
+            "git commit -m \"fix: make it ok\" && make -j8",
+            false,
+            "heavy run -- make -j8",
+        ),
+        (
+            "echo \"cargo build\" && cargo build --release",
+            false,
+            "heavy run -- cargo build --release",
+        ),
+        (
+            "CFLAGS=\"-O2 -g\" make -j8",
+            false,
+            "CFLAGS=\"-O2 -g\" heavy run -- make -j8",
+        ),
+        (
+            "cargo build 2>&1 | tee log",
+            false,
+            "heavy run -- cargo build 2>&1",
+        ),
+        (
+            "& \"D:\\My Tools\\build.ps1\" -Release",
+            true,
+            "heavy run -- pwsh -NoProfile -File \"D:\\My Tools\\build.ps1\" -Release",
+        ),
+        (
+            "\"./my dir/build.sh\" --fast",
+            false,
+            "heavy run -- sh \"./my dir/build.sh\" --fast",
+        ),
+        (
+            "timeout 600 cargo build --release",
+            false,
+            "timeout 600 heavy run -- cargo build --release",
         ),
     ] {
         let Verdict::Deny(reason) = judge(&cfg, command, false, powershell) else {

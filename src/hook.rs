@@ -15,9 +15,9 @@ use std::io::Read;
 
 /// Start of a command, plus PowerShell `&`, `cmd /c`, bash `VAR=x`, `env`/`time` prefixes and shell
 /// keywords that begin a command (`then`, `do`, `if`, ...), which count only after a separator.
-const START: &str = r#"(?:^|[\n;|&({])\s*(?:&\s*)?(?:(?:then|do|else|elif|if|while|until|!|cmd(?:\.exe)?\s+//?[ck]|time|env|nice|start(?:\s+/\w+)*|[A-Za-z_][A-Za-z0-9_]*=[^\s;|&(){}]*)\s+)*(?:['"][^'"\n]*[\\/]|['"]?(?:[^\s'";|&(){}]*[\\/])?)"#;
+const START: &str = r#"(?:^|[\n;|&({`])\s*(?:&\s*)?(?:(?:then|do|else|elif|if|while|until|!|cmd(?:\.exe)?\s+//?[ck]|time|env|nice(?:\s+(?:-n\s*-?\d+|-\d+|--adjustment=-?\d+))*|timeout(?:\s+(?:-[ks]\s*\S+|--[a-z-]+(?:=\S+)?|-[a-z]+))*\s+\d+(?:\.\d+)?[smhd]?|start(?:\s+/\w+)*|[A-Za-z_][A-Za-z0-9_]*=[^\s;|&(){}]*)\s+)*(?:['"][^'"\n]*[\\/]|['"]?(?:[^\s'";|&(){}]*[\\/])?)"#;
 /// End of a program name: optional Windows extension, optional closing quote, then a separator.
-const END: &str = r#"(?:\.exe|\.cmd|\.bat)?['"]?(?:\s|$|[;|&)}])"#;
+const END: &str = r#"(?:\.exe|\.cmd|\.bat)?['"]?(?:\s|$|[;|&)}`])"#;
 
 const BUILD_PROGRAMS: &[&str] = &[
     r"cargo@(?:\s+\+\S+)?\s+(?:build|b|run|r|test|t|check|c|clippy|bench|install|doc|rustc|nextest|xtask|tauri\s+build)\b",
@@ -343,64 +343,126 @@ pub fn judge(cfg: &Config, command: &str, is_subagent: bool, powershell: bool) -
     ))
 }
 
-/// The whole simple command around a match, with its arguments and quoting, from the original
-/// text: from the match to the next unquoted separator, or to a quote that closes an enclosing
-/// shell body. Falls back to the match itself when it is not found verbatim.
+/// Shell prefixes that come before the program: control keywords, PowerShell `&`, `cmd /c`,
+/// `VAR=value` (quoted values allowed), `time`, `env`, `nice`, `timeout` and `start`.
+fn prefix_regex() -> Regex {
+    Regex::new(
+        r#"(?i)^\s*(?:&\s*)?(?:(?:then|do|else|elif|if|while|until|!|cmd(?:\.exe)?\s+//?[ck]|time|env|nice(?:\s+(?:-n\s*-?\d+|-\d+|--adjustment=-?\d+))*|timeout(?:\s+(?:-[ks]\s*\S+|--[a-z-]+(?:=\S+)?|-[a-z]+))*\s+\d+(?:\.\d+)?[smhd]?|start(?:\s+/\w+)*|[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;|&(){}'"])*)\s+)*"#,
+    )
+    .expect("prefix regex")
+}
+
+/// Whether `ch` at byte `i` ends a simple command. `&` in a redirect (`2>&1`, `&>`) does not.
+fn is_separator(text: &str, i: usize, ch: char) -> bool {
+    match ch {
+        '\n' | ';' | '|' | '(' | ')' | '{' | '}' | '`' => true,
+        '&' => !text[..i].ends_with('>') && !text[i + 1..].starts_with('>'),
+        _ => false,
+    }
+}
+
+/// The whole simple command that the classifier matched, with its prefixes, arguments and
+/// quoting, taken from the original text. The match comes from masked text, so it is located
+/// again here: the first occurrence in command position outside quotes, otherwise (a body
+/// inside `bash -c '...'`) the first occurrence anywhere. Falls back to the match itself.
 fn command_span(command: &str, found: &str) -> String {
     let text = command.replace("\r\n", "\n");
-    let Some(start) = text.find(found) else {
+    let prefix = prefix_regex();
+    let core = prefix.find(found).map_or(found, |m| &found[m.end()..]);
+    if core.is_empty() {
+        return found.to_string();
+    }
+    let at_word = |i: usize| {
+        text[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| c.is_whitespace() || "'\";|&(){}`".contains(c))
+    };
+    let mut quote: Option<char> = None;
+    let mut prev = '\0';
+    let mut command_start = 0;
+    let mut located = None;
+    let mut fallback = None;
+    for (i, ch) in text.char_indices() {
+        if text[i..].starts_with(core) && at_word(i) {
+            let leading = &text[command_start..i];
+            let in_position = prefix
+                .find(leading)
+                .is_some_and(|m| m.end() == leading.len());
+            if quote.is_none() && in_position {
+                located = Some((command_start, i));
+                break;
+            }
+            fallback.get_or_insert((i, i));
+        }
+        match quote {
+            Some(q) => {
+                if ch == q && !(q == '"' && (prev == '\\' || prev == '`')) {
+                    quote = None;
+                }
+            }
+            None if ch == '\'' || ch == '"' => quote = Some(ch),
+            None if is_separator(&text, i, ch) => command_start = i + ch.len_utf8(),
+            None => {}
+        }
+        prev = ch;
+    }
+    let Some((start, core_at)) = located.or(fallback) else {
         return found.to_string();
     };
     let mut quote = None;
     let mut end = text.len();
-    for (offset, ch) in text[start..].char_indices() {
+    for (offset, ch) in text[core_at..].char_indices() {
+        let i = core_at + offset;
         if let Some(q) = quote {
             if ch == q {
                 quote = None;
             }
             continue;
         }
-        if offset >= found.len() && (ch == '\'' || ch == '"') {
+        if offset < core.len() {
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
             // A quote opened inside the span is an argument; one that closes the enclosing body
             // ends the span. Look ahead for its partner on the same line.
-            let partner = text[start + offset + 1..]
+            let partner = text[i + 1..]
                 .split('\n')
                 .next()
                 .is_some_and(|rest| rest.contains(ch));
             if !partner {
-                end = start + offset;
+                end = i;
                 break;
             }
             quote = Some(ch);
             continue;
         }
-        if offset >= found.len() && matches!(ch, '\n' | ';' | '|' | '&' | ')' | '}') {
-            end = start + offset;
+        if is_separator(&text, i, ch) {
+            end = i;
             break;
         }
     }
     // Control keywords (`then make`) are shell syntax, not part of the blocked command.
     let keywords =
         Regex::new(r"^(?:(?:then|do|else|elif|if|while|until|!)\s+)+").expect("keyword regex");
-    let span = text[start..end].trim();
-    keywords.replace(span, "").into_owned()
+    keywords.replace(text[start..end].trim(), "").into_owned()
 }
 
-/// `heavy run --` placed after shell prefixes (`VAR=x`, `time`, `cmd /c`, `then`, ...) and with an
+/// `heavy run --` placed after shell prefixes (`VAR=x`, `time`, `cmd /c`, ...) and with an
 /// interpreter in front of scripts that cannot be started directly.
 fn wrapped_form(span: &str) -> String {
-    let prefix = Regex::new(
-        r#"(?i)^\s*(?:&\s*)?(?:(?:then|do|else|elif|if|while|until|!|cmd(?:\.exe)?\s+//?[ck]|time|env|nice|start(?:\s+/\w+)*|[A-Za-z_][A-Za-z0-9_]*=[^\s;|&(){}]*)\s+)*"#,
-    )
-    .expect("prefix regex");
-    let cut = prefix.find(span).map_or(0, |m| m.end());
+    let cut = prefix_regex().find(span).map_or(0, |m| m.end());
     let head = span[..cut]
         .trim_start()
         .trim_start_matches('&')
         .trim_start();
     let rest = &span[cut..];
-    let program = rest.split_whitespace().next().unwrap_or("");
-    let lower = program.trim_matches(['\'', '"']).to_ascii_lowercase();
+    // A quoted program path may contain spaces.
+    let program = match rest.chars().next() {
+        Some(q @ ('\'' | '"')) => rest[1..].split(q).next().unwrap_or(""),
+        _ => rest.split_whitespace().next().unwrap_or(""),
+    };
+    let lower = program.to_ascii_lowercase();
     let interpreter = if lower.ends_with(".ps1") {
         "pwsh -NoProfile -File "
     } else if lower.ends_with(".sh") {
