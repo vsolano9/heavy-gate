@@ -40,6 +40,10 @@ const HEAVY_PROGRAMS: &[&str] = &[
 ];
 
 /// `@` in a pattern marks where a program name ends and its arguments begin.
+/// Commands longer than this are not parsed; they are only searched for a build anywhere.
+const MAX_CLASSIFIED: usize = 1 << 20;
+/// Hook payloads longer than this are not read and pass.
+const MAX_PAYLOAD: u64 = 8 << 20;
 const NAME_END: &str = r#"(?:\.exe|\.cmd|\.bat)?['"]?"#;
 
 fn compile(programs: &[&str], extras: &[String]) -> Regex {
@@ -76,37 +80,45 @@ fn gate_prefix() -> Regex {
     )).expect("gate regex")
 }
 
+/// Where a wrapped target that starts at `start` ends: the first separator outside quotes and
+/// nesting, or the end of the text with nesting balanced. `None` when nesting never closes.
+fn target_end(command: &str, start: usize, brackets: bool) -> Option<usize> {
+    let mut depth = 0_u32;
+    let mut quote = None;
+    for (offset, ch) in command[start..].char_indices() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+        let opens = ch == '\u{1e}' || (brackets && (ch == '(' || ch == '{'));
+        let closes = ch == '\u{1f}' || (brackets && (ch == ')' || ch == '}'));
+        if opens {
+            depth += 1;
+        } else if closes && depth > 0 {
+            depth -= 1;
+        } else if depth == 0 && matches!(ch, '\n' | ';' | '|' | '&' | ')' | '}') {
+            return Some(start + offset);
+        }
+    }
+    (depth == 0).then_some(command.len())
+}
+
 fn gated_targets(command: &str) -> (Vec<String>, String) {
     let re = gate_prefix();
     let mut targets = Vec::new();
     let mut outside = String::new();
     let mut from = 0;
     while let Some(m) = re.find_at(command, from) {
-        let mut depth = 0_u32;
-        let mut quote = None;
-        let mut end = command.len();
-        for (offset, ch) in command[m.end()..].char_indices() {
-            if let Some(q) = quote {
-                if ch == q {
-                    quote = None;
-                }
-                continue;
-            }
-            if ch == '\'' || ch == '"' {
-                quote = Some(ch);
-                continue;
-            }
-            match ch {
-                // Internal markers keep an expanded shell body within its wrapper.
-                '\u{1e}' | '(' | '{' => depth += 1,
-                '\u{1f}' | ')' | '}' if depth > 0 => depth -= 1,
-                '\n' | ';' | '|' | '&' | ')' | '}' if depth == 0 => {
-                    end = m.end() + offset;
-                    break;
-                }
-                _ => {}
-            }
-        }
+        // An unbalanced bracket would otherwise extend the target to the end of the line and
+        // bless whatever follows; then only the internal markers count as nesting.
+        let end = target_end(command, m.end(), true)
+            .unwrap_or_else(|| target_end(command, m.end(), false).unwrap_or(command.len()));
         outside.push_str(&command[from..m.start()]);
         outside.push_str("; ");
         targets.push(command[m.end()..end].to_string());
@@ -130,8 +142,9 @@ fn mask_data_inner(command: &str, powershell: bool, depth: usize) -> String {
     if depth >= 32 {
         return String::new();
     }
-    let heredoc =
-        Regex::new(r#"<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?"#).expect("heredoc regex");
+    // `<<<` is a here-string (one word of data), not a heredoc with a body.
+    let heredoc = Regex::new(r#"(?:^|[^<])<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?"#)
+        .expect("heredoc regex");
     let mut text = command.to_string();
     let mut from = 0;
     while let Some(caps) = heredoc.captures(&text[from..]) {
@@ -278,10 +291,19 @@ pub enum Verdict {
 }
 
 pub fn judge(cfg: &Config, command: &str, is_subagent: bool, powershell: bool) -> Verdict {
-    if cfg.hook.disabled || command.len() > 1_048_576 {
+    if cfg.hook.disabled {
         return Verdict::Pass;
     }
     let build_re = compile(BUILD_PROGRAMS, &cfg.hook.extra_build_programs);
+    if command.len() > MAX_CLASSIFIED {
+        // Too large to parse: deny if a build appears anywhere rather than pass it unseen.
+        return match first_run(&build_re, command) {
+            Some(found) => Verdict::Deny(format!(
+                "Machine-wide memory rule: this command is too large for the hook to classify and contains                  `{found}`. Run the heavy part as its own command, prefixed by `heavy run -- `."
+            )),
+            None => Verdict::Pass,
+        };
+    }
     let visible = mask_data(command, powershell);
     let (targets, outside) = gated_targets(&visible);
     let build = first_run(&build_re, &outside);
@@ -307,12 +329,23 @@ pub fn judge(cfg: &Config, command: &str, is_subagent: bool, powershell: bool) -
     let heavy_path = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "heavy".into());
+    // `heavy run` starts programs, not scripts: name the interpreter for anything but .cmd/.bat.
+    let lower = what.to_ascii_lowercase();
+    let is_script = [".ps1", ".sh", ".py"]
+        .iter()
+        .any(|ext| lower.trim_end_matches(['\'', '"']).ends_with(ext));
+    let script_hint = if is_script {
+        " A script runs through its interpreter, for example \
+             `heavy run -- pwsh -NoProfile -File ./build.ps1` or `heavy run -- sh ./build.sh`."
+    } else {
+        ""
+    };
     Verdict::Deny(format!(
         "Machine-wide memory rule: heavy commands (builds, compiles, Blender, video renders) run through the shared \
          gate so parallel sessions cannot exhaust RAM. Blocked: `{what}`. Rerun the same command with only the heavy \
          part prefixed by `heavy run -- `, for example `heavy run -- cargo build --release` or \
          `cd app && heavy run -- npm run build` (executable path if `heavy` is not on PATH: {heavy_path:?}). \
-         The gate may wait when the machine is busy; `heavy status` shows slots and memory."
+         The gate may wait when the machine is busy; `heavy status` shows slots and memory.{script_hint}"
     ))
 }
 
@@ -323,10 +356,10 @@ pub fn run(cfg: &Config) -> i32 {
     }
     let mut input = String::new();
     if std::io::stdin()
-        .take(1_048_577)
+        .take(MAX_PAYLOAD + 1)
         .read_to_string(&mut input)
         .is_err()
-        || input.len() > 1_048_576
+        || input.len() as u64 > MAX_PAYLOAD
     {
         return 0;
     }

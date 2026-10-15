@@ -427,6 +427,35 @@ fn shell_command_cases() {
             true,
             false,
         ),
+        (
+            "unbalanced brace in wrapped target",
+            "heavy run -- echo { ; cargo build",
+            false,
+            false,
+            true,
+        ),
+        (
+            "here-string then build",
+            "wc -l <<< hello
+cargo build",
+            false,
+            false,
+            true,
+        ),
+        (
+            "here-string data",
+            "grep -c x <<< 'cargo build'",
+            false,
+            false,
+            false,
+        ),
+        (
+            "balanced group in wrapped target",
+            "heavy run -- bash -c 'cd app && { cargo build; }'",
+            false,
+            false,
+            false,
+        ),
     ];
     let cfg = LoadedConfig::parse("unused.toml".into(), "").config;
     for (name, command, powershell, subagent, deny) in cases {

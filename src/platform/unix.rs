@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+static FLOCK_WARNED: AtomicBool = AtomicBool::new(false);
+
 pub(crate) struct Slot {
     pub(crate) index: u32,
     file: File,
@@ -43,6 +45,18 @@ impl Slot {
         // SAFETY: file owns a valid descriptor for the duration of this call.
         self.held =
             unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        if !self.held {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EWOULDBLOCK)
+                && !FLOCK_WARNED.swap(true, Ordering::Relaxed)
+            {
+                // A filesystem without flock support would otherwise look like every slot is busy.
+                eprintln!(
+                    "heavy-gate: warning: cannot lock slot {} in the state directory: {error}",
+                    self.index
+                );
+            }
+        }
         self.held
     }
 
@@ -137,6 +151,9 @@ pub(crate) struct Signals {
 
 impl Signals {
     pub(crate) fn new() -> io::Result<Self> {
+        // An inherited SIGCHLD ignore makes the kernel reap the child, so its status would be lost.
+        // SAFETY: restoring the default disposition is always valid.
+        unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
         let mut signals = Self {
             flags: Vec::new(),
             registrations: Vec::new(),

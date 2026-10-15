@@ -101,17 +101,22 @@ heavy run -- sh -c 'make all && make package'
 heavy run -- pwsh -NoProfile -Command 'npm run build; if ($LASTEXITCODE) { exit $LASTEXITCODE }; npm run package'
 ```
 
-On Windows, executable resolution also supports command shims such as `npm.cmd`.
+On Windows, executable resolution also supports command shims such as `npm.cmd`, and `.cmd` and `.bat` scripts start directly. Other scripts run through their interpreter:
+
+```powershell
+heavy run -- pwsh -NoProfile -File .\build.ps1
+heavy run -- python build.py
+```
 
 ## How it works
 
 Each `heavy run` waits for both a shared slot and enough available memory, rechecks memory after taking the slot, and holds the slot until the child exits. Waiters periodically retry and report why they are waiting. There is no daemon, persistent queue, or FIFO ordering guarantee.
 
-Windows uses `Local` named mutexes whose names include a hash of the state directory. Unix uses `flock` locks in the state directory. Kernel locks are released when their owning process exits, including after a crash. Metadata files describe holders; they are not the lock authority. All cooperating sessions should use the same slot count and the same state directory.
+Windows uses `Local` named mutexes whose names include a hash of the canonical state directory, so different spellings of one directory (relative paths, junctions, short names) share one gate. Unix uses `flock` locks in the state directory. Kernel locks are released when their owning process exits, including after a crash. Metadata files describe holders; they are not the lock authority. All cooperating sessions should use the same slot count and the same state directory.
 
 By default, `heavy` sets `CARGO_BUILD_JOBS` and `CMAKE_BUILD_PARALLEL_LEVEL` for the child only when each variable is unset. `--no-jobs-env` disables this. Other build tools need their own parallelism settings.
 
-On Windows, the wrapper attempts to join a [kill-on-close Job Object](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects) before starting the child so children inherit membership. If that is unavailable, it warns and attempts to assign the child after spawning. That fallback has an assignment race and host Job Object restrictions can prevent containment. On Unix, the child remains in the wrapper's process group and the wrapper forwards `SIGINT`, `SIGTERM`, and `SIGHUP` to the child. Linux additionally gives the direct child a [parent-death `SIGKILL`](https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html).
+On Windows, the wrapper attempts to join a [kill-on-close Job Object](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects) before starting the child so children inherit membership. If that is unavailable, it warns and attempts to assign the child after spawning. That fallback has an assignment race and host Job Object restrictions can prevent containment. On Unix, the child remains in the wrapper's process group and the wrapper forwards `SIGINT`, `SIGTERM`, and `SIGHUP` to the child. Linux additionally gives the direct child a [parent-death `SIGKILL`](https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html). On Windows, Ctrl+C or Ctrl+Break reaches the child through the shared console, and the wrapper itself stays alive to record the run; Ctrl+C while still waiting for admission ends the wait with exit 130, as `SIGINT` does on Unix.
 
 ## Commands and exit codes
 
@@ -141,7 +146,7 @@ Place `run` options before the program. `--` ends option parsing. `--max-wait` l
 | Exit | Meaning |
 | --- | --- |
 | Child's exit code | The child started and exited normally. |
-| `128 + signal` | On Unix, the child terminated by a signal. |
+| `128 + signal` | On Unix, the child terminated by a signal, or the wrapper got `SIGINT`, `SIGTERM`, or `SIGHUP` while waiting for admission and never started it. On Windows, Ctrl+C while waiting returns 130. |
 | `75` | Admission timed out. |
 | `127` | The child could not be started. |
 | `2` | Invalid CLI usage. |
@@ -188,7 +193,7 @@ Additional program entries are names such as `mybuilder`, not paths, shell fragm
 
 ## Claude Code hook
 
-Merge a `PreToolUse` entry into your user `~/.claude/settings.json` or project `.claude/settings.json`. Ensure the executable is on the environment's `PATH`, or use an absolute executable path.
+Merge a `PreToolUse` entry into your user `~/.claude/settings.json` or project `.claude/settings.json`. Ensure the executable is on the environment's `PATH`, or use an absolute executable path. JSON needs Windows backslashes doubled (`"C:\\Tools\\heavy.exe"`), or use forward slashes (`"C:/Tools/heavy.exe"`).
 
 Windows, using direct execution:
 
@@ -226,7 +231,7 @@ Linux and macOS:
 
 The [official Claude Code hook reference](https://code.claude.com/docs/en/hooks#exec-form-and-shell-form) specifies a string `command` with an optional `args` array for exec form. A `command` array is not that schema. The Unix example uses shell form; it can also use `"command": "heavy", "args": ["hook"]`. Use a Claude Code version supporting exec form for the Windows example.
 
-The hook denies recognized unwrapped build and heavy commands with a suggested `heavy run --` prefix. It recognizes common Rust, C/C++, .NET, Java, JavaScript, Go, Swift, and Zig build commands, build scripts, Blender, and Remotion and HyperFrames `render` commands. `ffmpeg` is not a default match. Help and version probes pass. Quoted data and here-documents are handled heuristically to reduce false positives. A wrapper only covers its own command: `heavy run -- cargo build && make` still denies the unwrapped `make`. Inputs larger than 1 MiB and shell bodies nested past 32 levels are outside the classifier's limits and pass without inspection of the excluded input.
+The hook denies recognized unwrapped build and heavy commands with a suggested `heavy run --` prefix. It recognizes common Rust, C/C++, .NET, Java, JavaScript, Go, Swift, and Zig build commands, build scripts, Blender, and Remotion and HyperFrames `render` commands. `ffmpeg` is not a default match. Help and version probes pass. Quoted data and here-documents are handled heuristically to reduce false positives. A wrapper only covers its own command: `heavy run -- cargo build && make` still denies the unwrapped `make`. Commands larger than 1 MiB are not parsed; they deny if a recognized build appears anywhere in them. Hook payloads larger than 8 MiB and shell bodies nested past 32 levels are outside the classifier's limits and pass without inspection of the excluded input.
 
 An `agent_id` in the payload identifies a subagent. With `subagent_builds = "deny"`, a build is denied even inside `heavy run`; the subagent should hand its build command back to the lead. Set `"gate"` to permit gated subagent builds. The hook does not install itself or modify another tool's settings.
 
@@ -294,7 +299,7 @@ Labels and working directories can contain private information. Logs stay local,
 
 **How is available memory measured?** Windows uses `GlobalMemoryStatusEx` available physical memory. Linux reads `/proc/meminfo` `MemAvailable`, falling back to `MemFree + Buffers + Cached` if absent; total memory is `MemTotal`. macOS reads `hw.memsize` and multiplies it by the kernel's `kern.memorystatus_level` percentage. The macOS value is a system availability estimate rather than an exact reclaimable-byte count. If the available-memory query fails, the floor is treated as satisfied with one warning to stderr per invocation. `status` shows unknown for unavailable readings.
 
-**What happens when the wrapper dies?** Its slot lock is released. Windows Job Object containment attempts to terminate contained descendants. Linux's parent-death signal covers the direct child. Unix descendants can outlive the wrapper or escape the original process group, especially after abrupt termination; their work can continue after the slot becomes free. Unix signal forwarding is not full process-tree containment.
+**What happens when the wrapper dies?** Its slot lock is released. Windows Job Object containment attempts to terminate contained descendants. On Windows the job also ends descendants that are still running when the wrapper exits normally, so a build daemon meant to outlive the build (a Gradle daemon, an sccache server) should be started outside `heavy run`. Linux's parent-death signal covers the direct child. Unix descendants can outlive the wrapper or escape the original process group, especially after abrupt termination; their work can continue after the slot becomes free. Unix signal forwarding is not full process-tree containment.
 
 **Is the hook a security boundary?** No. It uses command heuristics, can miss indirect or unusual invocations, and fails open on malformed hook input. It only sees configured Bash and PowerShell tool events. Direct wrappers provide coordination for commands that actually use them; use OS isolation and tool permissions for enforcement against untrusted commands.
 

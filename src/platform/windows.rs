@@ -3,7 +3,9 @@ use std::io;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
+use std::sync::atomic::{AtomicBool, Ordering};
+use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
+use windows_sys::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -22,8 +24,8 @@ pub(crate) struct Slot {
 
 impl Slot {
     pub(crate) fn open(index: u32, state_dir: &Path) -> Option<Self> {
-        // Slots belong to a state directory, as the Unix lock files do: every process using the
-        // same state_dir competes for the same slots, and a separate state_dir is a separate gate.
+        // Slots belong to a state directory, as the Unix lock files do: processes in the same logon
+        // session (the `Local` namespace) that use the same state_dir compete for the same slots.
         let scope = state_scope(state_dir);
         let name: Vec<u16> = format!("Local\\heavy-gate-{scope:016x}-slot-{index}")
             .encode_utf16()
@@ -68,12 +70,19 @@ impl Drop for Slot {
     }
 }
 
-/// FNV-1a of the absolute, lowercased state directory (Windows paths are case-insensitive).
-/// `std::path::absolute` does not touch the filesystem, so the scope is the same before and after
-/// the directory exists (canonicalize would add a `\\?\` prefix only once it does).
+/// FNV-1a of the canonical, lowercased state directory (Windows paths are case-insensitive).
+/// Callers create the directory before opening slots, so canonicalize resolves `..`, junctions,
+/// symlinks and short names to one spelling. Its verbatim prefix is stripped so that the absolute
+/// fallback (used only if canonicalize fails) hashes the same way.
 fn state_scope(state_dir: &Path) -> u64 {
-    let path = std::path::absolute(state_dir).unwrap_or_else(|_| state_dir.to_path_buf());
+    let path = std::fs::canonicalize(state_dir)
+        .or_else(|_| std::path::absolute(state_dir))
+        .unwrap_or_else(|_| state_dir.to_path_buf());
     let text = path.to_string_lossy().replace('/', "\\").to_lowercase();
+    let text = match text.strip_prefix(r"\\?\unc\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => text.strip_prefix(r"\\?\").unwrap_or(&text).to_string(),
+    };
     text.trim_end_matches('\\')
         .bytes()
         .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
@@ -96,13 +105,30 @@ pub(crate) fn total_memory_bytes() -> Option<u64> {
     Some(memory()?.ullTotalPhys)
 }
 
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "system" fn on_console_ctrl(event: u32) -> BOOL {
+    if event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT {
+        // The child shares the console and gets the same event; heavy outlives it to log the run.
+        INTERRUPTED.store(true, Ordering::SeqCst);
+        1
+    } else {
+        0
+    }
+}
+
+/// Ctrl+C and Ctrl+Break are reported like SIGINT (exit 130), so an interrupted wait is logged.
 pub(crate) struct Signals;
 impl Signals {
     pub(crate) fn new() -> io::Result<Self> {
+        // SAFETY: the handler is a plain function that only stores to an atomic.
+        if unsafe { SetConsoleCtrlHandler(Some(on_console_ctrl), 1) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
         Ok(Self)
     }
     pub(crate) fn pending(&self) -> Option<i32> {
-        None
+        INTERRUPTED.swap(false, Ordering::SeqCst).then_some(2)
     }
 }
 
@@ -140,14 +166,17 @@ impl Drop for Job {
     }
 }
 
-/// Find shell shims (notably npm.cmd) as well as native executables.
+/// Find shell shims (notably npm.cmd) as well as native executables. A bare name is looked up on
+/// PATH only, never in the current directory: first as given when it already has an extension,
+/// then with each PATHEXT extension, so `python3.12` still finds `python3.12.exe`.
 fn resolve_program(program: &str) -> PathBuf {
     let given = PathBuf::from(program);
-    if given.is_file() || given.extension().is_some() {
+    let has_dir = given.components().count() > 1;
+    if has_dir && given.is_file() {
         return given;
     }
     let extensions = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
-    let dirs: Vec<PathBuf> = if given.components().count() > 1 {
+    let dirs: Vec<PathBuf> = if has_dir {
         vec![PathBuf::new()]
     } else {
         std::env::var_os("PATH")
@@ -155,6 +184,12 @@ fn resolve_program(program: &str) -> PathBuf {
             .unwrap_or_default()
     };
     for dir in dirs {
+        if !has_dir && given.extension().is_some() {
+            let candidate = dir.join(program);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
         for extension in extensions.split(';').filter(|e| !e.is_empty()) {
             let candidate = dir.join(format!("{program}{extension}"));
             if candidate.is_file() {
