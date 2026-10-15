@@ -181,8 +181,14 @@ fn quoted_end(chars: &[char], i: usize, powershell: bool) -> usize {
 /// The text a shell passes on for a quoted piece (`quote` is its quote character), with, for
 /// each of its bytes, the byte of `raw` where its character or its escape starts. In double
 /// quotes Bash drops the backslash in `\"`, `\\`, `\$` and `` \` ``, and PowerShell drops the
-/// backtick before any character; PowerShell reads a doubled quote as one in either kind.
-fn unescape_body(raw: &str, powershell: bool, quote: char) -> (String, Vec<usize>) {
+/// backtick before any character; PowerShell reads a doubled quote as one in either kind. A body
+/// headed for PowerShell also drops backtick escapes when Bash passes it on.
+fn unescape_body(
+    raw: &str,
+    powershell: bool,
+    inner_powershell: bool,
+    quote: char,
+) -> (String, Vec<usize>) {
     let mut text = String::with_capacity(raw.len());
     let mut from = Vec::with_capacity(raw.len());
     let mut chars = raw.char_indices().peekable();
@@ -193,6 +199,10 @@ fn unescape_body(raw: &str, powershell: bool, quote: char) -> (String, Vec<usize
             (true, _, Some(&(_, next))) => ch == quote && next == quote,
             _ => false,
         };
+        // A body for PowerShell keeps reading `` `" `` as a quote whichever shell passes it on, so a
+        // build after it is never mistaken for quoted data.
+        let escaped =
+            escaped || (ch == '`' && quote == '"' && inner_powershell && chars.peek().is_some());
         // An escaped character stands for its whole escape, so a span that ends at it stops
         // before the escape character.
         let ch = if escaped {
@@ -366,7 +376,8 @@ fn mask_data_inner(command: &str, powershell: bool, depth: usize) -> (String, Ve
                 loop {
                     let q = chars[p];
                     let start = at[p] + q.len_utf8();
-                    let (piece, from) = unescape_body(&text[start..at[k]], powershell, q);
+                    let (piece, from) =
+                        unescape_body(&text[start..at[k]], powershell, inner_powershell, q);
                     inner.push_str(&piece);
                     source.extend(from.iter().map(|&o| start + o));
                     if k + 1 < chars.len() && (chars[k + 1] == '\'' || chars[k + 1] == '"') {

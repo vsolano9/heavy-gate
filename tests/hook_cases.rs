@@ -510,6 +510,13 @@ fn shell_command_cases() {
             true,
         ),
         (
+            "backtick-escaped quotes in a pwsh -Command body (Bash)",
+            r#"pwsh -Command "Write-Output `"hi`"; cargo build""#,
+            false,
+            false,
+            true,
+        ),
+        (
             "adjacent quoted data stays data",
             r#"bash -c 'echo a'"'"'b'"'"' make'"#,
             false,
