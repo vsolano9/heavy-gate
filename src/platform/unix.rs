@@ -183,7 +183,7 @@ impl Drop for Signals {
     }
 }
 
-pub(crate) fn command(program: &str) -> Command {
+pub(crate) fn command(program: &std::ffi::OsStr) -> Command {
     Command::new(program)
 }
 

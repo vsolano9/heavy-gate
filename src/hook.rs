@@ -19,17 +19,21 @@ const START: &str = r#"(?:^|[\n;|&({`])\s*(?:&\s*)?(?:(?:then|do|else|elif|if|wh
 /// End of a program name: optional Windows extension, optional closing quote, then a separator.
 const END: &str = r#"(?:\.exe|\.cmd|\.bat)?['"]?(?:\s|$|[;|&)}`])"#;
 
+/// Global options that may come between a program and its subcommand (`cargo --offline build`,
+/// `npm --prefix web run build`): a flag with an optional `=value` or a separate value.
+const OPTS: &str = r"(?:\s+--?[A-Za-z][\w.-]*(?:=\S+)?(?:\s+[^\s\-;|&(){}][^\s;|&(){}]*)?)*";
+
 const BUILD_PROGRAMS: &[&str] = &[
-    r"cargo@(?:\s+\+\S+)?\s+(?:build|b|run|r|test|t|check|c|clippy|bench|install|doc|rustc|nextest|xtask|tauri\s+build)\b",
+    r"cargo@(?:\s+\+\S+)?%\s+(?:build|b|run|r|test|t|check|c|clippy|bench|install|doc|rustc|nextest|xtask|tauri\s+build)\b",
     r"(?:rustc|cl|clang|clang\+\+|clang-cl|gcc|g\+\+|c\+\+|msbuild|devenv|ninja|make|nmake|mingw32-make|jom|gradlew?|mvn|xcodebuild|tsc|webpack|wasm-pack)",
-    r"dotnet@\s+(?:build|run|test|publish|pack|watch|msbuild)\b",
+    r"dotnet@%\s+(?:build|run|test|publish|pack|watch|msbuild)\b",
     r"cmake@\s+--build\b",
-    r"(?:npm|pnpm|yarn|bun)@\s+(?:run\s+)?(?:build|test|typecheck|tsc)",
+    r"(?:npm|pnpm|yarn|bun)@%(?:\s+workspace\s+\S+)?\s+(?:run\s+)?(?:build|test|typecheck|tsc)",
     r"npx@\s+(?:-\S+\s+)*(?:vite\s+build|tsc|next\s+build|webpack|turbo|tauri\s+build)",
     r"(?:vite|next|astro|nuxt|tauri)@\s+build\b",
-    r"turbo@\s+(?:run\s+)?build\b",
-    r"go@\s+(?:build|test|run|install|vet)\b",
-    r"swift@\s+(?:build|test|run)\b",
+    r"turbo@%\s+(?:run\s+)?build\b",
+    r"go@%\s+(?:build|test|run|install|vet)\b",
+    r"swift@%\s+(?:build|test|run)\b",
     r"zig@\s+(?:build|cc|c\+\+)\b",
     // Build scripts run directly or through a shell or interpreter.
     r#"(?:(?:pwsh|powershell|bash|sh|python3?|py)@(?:\s+-\S+)*\s+['"]?(?:[^\s'"]*[\\/])?)?[^\s'"\\/]*build[\w.-]*\.(?:ps1|sh|cmd|bat|py)"#,
@@ -40,7 +44,8 @@ const HEAVY_PROGRAMS: &[&str] = &[
     r"(?:npx@\s+)?(?:hyperframes|remotion)@\s+render\b",
 ];
 
-/// `@` in a pattern marks where a program name ends and its arguments begin.
+/// `@` in a pattern marks where a program name ends and its arguments begin; `%` where global
+/// options may come.
 /// Commands longer than this are not parsed; they are only searched for a build anywhere.
 const MAX_CLASSIFIED: usize = 1 << 20;
 /// Hook payloads longer than this are not read and pass.
@@ -48,7 +53,7 @@ const MAX_PAYLOAD: u64 = 8 << 20;
 const NAME_END: &str = r#"(?:\.exe|\.cmd|\.bat)?['"]?"#;
 
 fn compile(programs: &[&str], extras: &[String]) -> Regex {
-    let mut alternation = programs.join("|").replace('@', NAME_END);
+    let mut alternation = programs.join("|").replace('@', NAME_END).replace('%', OPTS);
     for name in extras {
         alternation.push('|');
         alternation.push_str(&regex::escape(name));
@@ -126,8 +131,42 @@ fn gated_targets(command: &str, powershell: bool) -> (Vec<String>, String, Vec<(
         });
         outside.push_str(&command[from..m.start()]);
         outside.push_str("; ");
-        targets.push(command[m.end()..end].to_string());
-        ranges.push((m.end(), end));
+        // Substitutions in the target's arguments run before `heavy` starts: they are outside it.
+        let chars: Vec<char> = command[m.end()..end].chars().collect();
+        let offsets: Vec<usize> = command[m.end()..end]
+            .char_indices()
+            .map(|(b, _)| m.end() + b)
+            .chain(std::iter::once(end))
+            .collect();
+        // A substitution inside a shell body (`bash -c '...'`) runs in that shell, inside the wrapper.
+        let mut level = 0_usize;
+        let nested: Vec<bool> = chars
+            .iter()
+            .map(|&ch| {
+                match ch {
+                    '\u{1e}' => level += 1,
+                    '\u{1f}' => level = level.saturating_sub(1),
+                    _ => {}
+                }
+                level > 0
+            })
+            .collect();
+        let mut target = String::new();
+        let mut kept = m.end();
+        for (a, b) in substitutions(&chars, 0, chars.len(), powershell)
+            .into_iter()
+            .filter(|&(a, _)| !nested[a.min(chars.len() - 1)])
+        {
+            let (a, b) = (offsets[a], offsets[b]);
+            target.push_str(&command[kept..a]);
+            outside.push_str(&command[a..b]);
+            outside.push_str("; ");
+            ranges.push((kept, a));
+            kept = b;
+        }
+        target.push_str(&command[kept..end]);
+        targets.push(target);
+        ranges.push((kept, end));
         from = end;
     }
     outside.push_str(&command[from..]);
@@ -158,16 +197,19 @@ fn mask_data(command: &str, powershell: bool) -> Masked {
     }
 }
 
-/// Where the quoted piece opening at `i` closes (`chars.len()` when it never does). A backslash
-/// or backtick escapes the next character in double quotes; in PowerShell a doubled quote is
-/// one quote character.
+/// Where the quoted piece opening at `i` closes (`chars.len()` when it never does). In double
+/// quotes PowerShell escapes with a backtick and Bash with a backslash, and a Bash backtick opens
+/// a command substitution that runs to its partner; in PowerShell a doubled quote is one quote
+/// character.
 fn quoted_end(chars: &[char], i: usize, powershell: bool) -> usize {
     let c = chars[i];
     let mut j = i + 1;
     while j < chars.len() {
         let ch = chars[j];
-        let escape = c == '"' && (ch == '\\' || ch == '`');
-        if escape || (ch == c && powershell && chars.get(j + 1) == Some(&c)) {
+        let escape = c == '"' && ch == if powershell { '`' } else { '\\' };
+        if c == '"' && !powershell && ch == '`' {
+            j = substitution_end(chars, j).map_or(chars.len(), |e| e + 1);
+        } else if escape || (ch == c && powershell && chars.get(j + 1) == Some(&c)) {
             j += 2;
         } else if ch == c {
             break;
@@ -176,6 +218,59 @@ fn quoted_end(chars: &[char], i: usize, powershell: bool) -> usize {
         }
     }
     j.min(chars.len())
+}
+
+/// The closing backtick of a Bash backtick substitution opening at `i`.
+fn substitution_end(chars: &[char], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    while j < chars.len() {
+        match chars[j] {
+            '\\' => j += 2,
+            '`' => return Some(j),
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+/// Command substitutions in `chars[from..to]`, as (body start, body end) char indices: `$( )` in
+/// both shells and backticks in Bash. Escaped openers are skipped; nesting of parentheses is
+/// followed, quotes inside a body are not.
+fn substitutions(chars: &[char], from: usize, to: usize, powershell: bool) -> Vec<(usize, usize)> {
+    let escape = if powershell { '`' } else { '\\' };
+    let mut found = Vec::new();
+    let mut k = from;
+    while k < to {
+        let ch = chars[k];
+        if ch == escape {
+            k += 2;
+        } else if ch == '$' && chars.get(k + 1) == Some(&'(') {
+            let mut depth = 0_usize;
+            let mut e = k + 1;
+            while e < to {
+                match chars[e] {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                e += 1;
+            }
+            found.push((k + 2, e.min(to)));
+            k = e + 1;
+        } else if ch == '`' && !powershell {
+            let e = substitution_end(chars, k).unwrap_or(to).min(to);
+            found.push((k + 1, e));
+            k = e + 1;
+        } else {
+            k += 1;
+        }
+    }
+    found
 }
 
 /// The text a shell passes on for a quoted piece (`quote` is its quote character), with, for
@@ -304,6 +399,9 @@ fn mask_data_inner(command: &str, powershell: bool, depth: usize) -> (String, Ve
             let before = tail.trim_end();
             let lower = before.to_ascii_lowercase();
             let wrapped_program = gate.find_iter(tail).any(|m| m.end() == tail.len());
+            let at_start = wrapped_program
+                || (before.is_empty() && tail_from == 0)
+                || before.ends_with(|ch: char| ";|&({\n`".contains(ch));
             let program = wrapped_program
                 || if powershell {
                     before.ends_with('&') && !before.ends_with("&&")
@@ -403,8 +501,35 @@ fn mask_data_inner(command: &str, powershell: bool, depth: usize) -> (String, Ve
                     emit(&mut out, &mut origin, chars[k].encode_utf8(&mut buf), at[k]);
                 }
             } else {
-                emit(&mut out, &mut origin, c.encode_utf8(&mut buf), at[i]);
-                emit(&mut out, &mut origin, c.encode_utf8(&mut buf), close);
+                let end = j.min(chars.len());
+                let plain = end > i + 1
+                    && chars[i + 1..end].iter().all(|&ch| {
+                        !ch.is_whitespace() && !"\"'`$;|&(){}<>\\\u{1e}\u{1f}".contains(ch)
+                    });
+                if plain && !at_start {
+                    for k in i + 1..end {
+                        emit(&mut out, &mut origin, chars[k].encode_utf8(&mut buf), at[k]);
+                    }
+                } else {
+                    emit(&mut out, &mut origin, c.encode_utf8(&mut buf), at[i]);
+                    if c == '"' {
+                        for (a, b) in substitutions(&chars, i + 1, end, powershell) {
+                            let opener = if chars[a - 1] == '`' { "`" } else { "$(" };
+                            emit(&mut out, &mut origin, opener, at[a - opener.len()]);
+                            let body = &text[at[a]..at[b]];
+                            let (masked, from) = mask_data_inner(body, powershell, depth + 1);
+                            out.push_str(&masked);
+                            origin.extend(from.iter().map(|&o| at[a] + o));
+                            let closer = if opener == "`" { "`" } else { ")" };
+                            emit(&mut out, &mut origin, closer, at[b]);
+                        }
+                    }
+                    // A quote that never closes has no closer to show: `cargo build"` still ends
+                    // its program name at the end of the text.
+                    if j < chars.len() {
+                        emit(&mut out, &mut origin, c.encode_utf8(&mut buf), close);
+                    }
+                }
             }
             i = j + 1;
             continue;

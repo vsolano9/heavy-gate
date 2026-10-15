@@ -1,6 +1,7 @@
 //! The CLI uses the same configuration and classifier exported for contract tests.
 
 use heavy_gate::{config, gate, hook};
+use std::ffi::OsString;
 use std::time::Duration;
 
 const USAGE: &str = "usage:
@@ -14,9 +15,10 @@ const USAGE: &str = "usage:
   heavy --help";
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Arguments stay as the OS gave them: `heavy run` passes non-UTF-8 file names on unchanged.
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let loaded = config::LoadedConfig::load();
-    let command = args.first().map(String::as_str);
+    let command = args.first().and_then(|a| a.to_str());
     if command != Some("hook") {
         loaded.warn();
     }
@@ -41,7 +43,14 @@ fn main() {
         // Bad keys fall back to defaults here as in `run`, silently: a typo in the file must not
         // switch enforcement off. `[hook] disabled = true` is the explicit off switch.
         Some("hook") => hook::run(cfg),
-        Some("check") => check(cfg, &args[1..]),
+        Some("check") => match args[1..]
+            .iter()
+            .map(|a| a.to_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+        {
+            Some(text) => check(cfg, &text),
+            None => usage("check requires a UTF-8 COMMAND"),
+        },
         Some("--version" | "version") if args.len() == 1 => {
             println!("heavy {}", env!("CARGO_PKG_VERSION"));
             0
@@ -60,36 +69,40 @@ fn usage(reason: &str) -> i32 {
     2
 }
 
-fn run(cfg: &config::Config, args: &[String]) -> i32 {
+fn run(cfg: &config::Config, args: &[OsString]) -> i32 {
     let mut label = None;
     let mut max_wait = cfg.max_wait_secs;
     let mut set_jobs_env = true;
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "--label" => {
+        match args[i].to_str() {
+            Some("--label") => {
                 let Some(text) = args.get(i + 1) else {
                     return usage("--label requires TEXT");
                 };
-                label = Some(text.clone());
+                label = Some(text.to_string_lossy().into_owned());
                 i += 2;
             }
-            "--max-wait" => {
-                let Some(seconds) = args.get(i + 1).and_then(|s| s.parse::<u64>().ok()) else {
+            Some("--max-wait") => {
+                let Some(seconds) = args
+                    .get(i + 1)
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+                else {
                     return usage("--max-wait requires a nonnegative integer number of seconds");
                 };
                 max_wait = seconds;
                 i += 2;
             }
-            "--no-jobs-env" => {
+            Some("--no-jobs-env") => {
                 set_jobs_env = false;
                 i += 1;
             }
-            "--" => {
+            Some("--") => {
                 i += 1;
                 break;
             }
-            option if option.starts_with('-') => return usage("unknown run option"),
+            Some(option) if option.starts_with('-') => return usage("unknown run option"),
             _ => break,
         }
     }
@@ -98,8 +111,9 @@ fn run(cfg: &config::Config, args: &[String]) -> i32 {
     };
     let rest = args[i + 1..].to_vec();
     let label = label.unwrap_or_else(|| {
-        std::iter::once(program.as_str())
-            .chain(rest.iter().map(String::as_str))
+        std::iter::once(&program)
+            .chain(&rest)
+            .map(|a| a.to_string_lossy())
             .collect::<Vec<_>>()
             .join(" ")
             .chars()

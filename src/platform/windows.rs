@@ -168,7 +168,7 @@ impl Drop for Job {
 /// Find shell shims (notably npm.cmd) as well as native executables. A bare name is looked up on
 /// PATH only, never in the current directory: first as given when it already has an extension,
 /// then with each PATHEXT extension, so `python3.12` still finds `python3.12.exe`.
-fn resolve_program(program: &str) -> PathBuf {
+fn resolve_program(program: &std::ffi::OsStr) -> PathBuf {
     let given = PathBuf::from(program);
     let has_dir = given.components().count() > 1;
     if has_dir && given.is_file() {
@@ -190,7 +190,9 @@ fn resolve_program(program: &str) -> PathBuf {
             }
         }
         for extension in extensions.split(';').filter(|e| !e.is_empty()) {
-            let candidate = dir.join(format!("{program}{extension}"));
+            let mut name = program.to_os_string();
+            name.push(extension);
+            let candidate = dir.join(name);
             if candidate.is_file() {
                 return candidate;
             }
@@ -199,7 +201,7 @@ fn resolve_program(program: &str) -> PathBuf {
     given
 }
 
-pub(crate) fn command(program: &str) -> Command {
+pub(crate) fn command(program: &std::ffi::OsStr) -> Command {
     Command::new(resolve_program(program))
 }
 

@@ -199,8 +199,8 @@ pub struct RunOptions {
     pub label: String,
     pub max_wait: Duration,
     pub set_jobs_env: bool,
-    pub program: String,
-    pub args: Vec<String>,
+    pub program: std::ffi::OsString,
+    pub args: Vec<std::ffi::OsString>,
 }
 
 pub fn run(cfg: &Config, opts: RunOptions) -> i32 {

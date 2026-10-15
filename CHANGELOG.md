@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-10-15
+
+### Fixed
+
+- The hook now recognizes a quoted build subcommand or script path (`cargo "build"`, `pwsh -File './build.ps1'`), which the shell passes on as the plain word.
+- The hook recognizes global options before a build subcommand (`cargo --offline build`, `npm --prefix web run build`, `go -C sub build`).
+- PowerShell strings end where PowerShell ends them: a backslash before the closing quote (`"C:\"`) no longer hides the rest of the command.
+- Command substitutions run where the shell runs them: `$(...)` and Bash backticks inside double quotes are checked as commands, and a substitution in the arguments of `heavy run --` counts as outside the wrapper, since it runs before `heavy` starts.
+- `heavy run` passes arguments that are not valid UTF-8 (such as non-UTF-8 file names on Unix) through to the command instead of panicking.
+
 ## [1.0.0] - 2026-10-15
 
 First public version, developed from a gate previously used internally to coordinate builds and renders across independent agent sessions.

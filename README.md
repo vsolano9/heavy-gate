@@ -10,13 +10,13 @@ The `heavy` executable runs locally, requires no service or account, and makes n
 
 ### Release archives
 
-The v1.0.0 release asset names are:
+The v1.0.1 release asset names are:
 
 | Platform | Asset |
 | --- | --- |
-| Windows x86-64 | `heavy-v1.0.0-x86_64-pc-windows-msvc.zip` |
-| Linux x86-64, glibc | `heavy-v1.0.0-x86_64-unknown-linux-gnu.tar.gz` |
-| macOS Apple Silicon | `heavy-v1.0.0-aarch64-apple-darwin.tar.gz` |
+| Windows x86-64 | `heavy-v1.0.1-x86_64-pc-windows-msvc.zip` |
+| Linux x86-64, glibc | `heavy-v1.0.1-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS Apple Silicon | `heavy-v1.0.1-aarch64-apple-darwin.tar.gz` |
 | Checksums | `SHA256SUMS` |
 
 The following are download and verification examples for [GitHub Releases](https://github.com/vsolano9/heavy-gate/releases). They require the named assets to have been published; this document does not establish their availability. Verify the archive before extracting it, then put `heavy` or `heavy.exe` in a directory on `PATH`.
@@ -24,8 +24,8 @@ The following are download and verification examples for [GitHub Releases](https
 Windows, in PowerShell:
 
 ```powershell
-$release = 'https://github.com/vsolano9/heavy-gate/releases/download/v1.0.0'
-$asset = 'heavy-v1.0.0-x86_64-pc-windows-msvc.zip'
+$release = 'https://github.com/vsolano9/heavy-gate/releases/download/v1.0.1'
+$asset = 'heavy-v1.0.1-x86_64-pc-windows-msvc.zip'
 Invoke-WebRequest "$release/$asset" -OutFile $asset
 Invoke-WebRequest "$release/SHA256SUMS" -OutFile SHA256SUMS
 $entry = Select-String -LiteralPath SHA256SUMS -Pattern ([regex]::Escape($asset) + '$')
@@ -33,15 +33,15 @@ if (@($entry).Count -ne 1) { throw 'Missing or ambiguous checksum entry' }
 $expected = ($entry.Line -split '\s+')[0]
 $actual = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash
 if ($actual -ine $expected) { throw 'Checksum mismatch' }
-Expand-Archive -LiteralPath $asset -DestinationPath heavy-v1.0.0
+Expand-Archive -LiteralPath $asset -DestinationPath heavy-v1.0.1
 ```
 
 Linux:
 
 ```sh
 set -eu
-release=https://github.com/vsolano9/heavy-gate/releases/download/v1.0.0
-asset=heavy-v1.0.0-x86_64-unknown-linux-gnu.tar.gz
+release=https://github.com/vsolano9/heavy-gate/releases/download/v1.0.1
+asset=heavy-v1.0.1-x86_64-unknown-linux-gnu.tar.gz
 curl -fLO "$release/$asset"
 curl -fLO "$release/SHA256SUMS"
 grep "  $asset\$" SHA256SUMS | sha256sum --check --strict -
@@ -52,8 +52,8 @@ macOS:
 
 ```sh
 set -eu
-release=https://github.com/vsolano9/heavy-gate/releases/download/v1.0.0
-asset=heavy-v1.0.0-aarch64-apple-darwin.tar.gz
+release=https://github.com/vsolano9/heavy-gate/releases/download/v1.0.1
+asset=heavy-v1.0.1-aarch64-apple-darwin.tar.gz
 curl -fLO "$release/$asset"
 curl -fLO "$release/SHA256SUMS"
 grep "  $asset\$" SHA256SUMS | shasum -a 256 --check -
@@ -67,7 +67,7 @@ A checksum verifies integrity against the downloaded manifest. It does not indep
 With Rust 1.85 or later and the platform's native linker installed:
 
 ```sh
-cargo install --git https://github.com/vsolano9/heavy-gate --tag v1.0.0
+cargo install --git https://github.com/vsolano9/heavy-gate --tag v1.0.1
 ```
 
 For a local checkout, use `cargo install --path .`. Cargo installs the executable into its bin directory, usually `~/.cargo/bin`; add that directory to `PATH` if needed. Source installation requires the tag or checkout to be available and does not require a crates.io publication.
