@@ -1,182 +1,198 @@
-//! Machine-wide slots for heavy commands.
-//!
-//! Each slot is a named Windows mutex (`Local\heavy-gate-slot-N`). The holder keeps it for the
-//! life of its child; if the holder dies for any reason Windows abandons the mutex and the next
-//! waiter takes it, so a crashed or killed run can never leak a slot. The child runs inside a
-//! kill-on-close job object, so killing the holder also kills the whole build tree.
+//! Shared admission, holder metadata, and local run records.
 
-use crate::config::Config;
-use std::ffi::c_void;
-use std::io::Write;
+use crate::config::{create_state_dir, Config};
+use crate::platform::{self, Signals, Slot};
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::path::PathBuf;
-use std::process::Command;
+use std::sync::Once;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
-use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-};
-use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 
 pub const EXIT_GATE_TIMEOUT: i32 = 75;
+const GIB: f64 = 1_073_741_824.0;
 const POLL: Duration = Duration::from_secs(2);
 const REPORT_EVERY: Duration = Duration::from_secs(60);
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
+static MEMORY_WARNING: Once = Once::new();
 
 fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
-pub fn available_gb() -> f64 {
-    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
-        return f64::MAX;
+fn available() -> Option<u64> {
+    let bytes = platform::available_memory_bytes();
+    if bytes.is_none() {
+        MEMORY_WARNING.call_once(|| eprintln!(
+            "heavy-gate: warning: cannot read available memory; treating the memory floor as satisfied"
+        ));
     }
-    status.ullAvailPhys as f64 / (1024.0 * 1024.0 * 1024.0)
+    bytes
 }
 
-struct Slot {
-    index: u32,
-    handle: HANDLE,
-}
-
-impl Slot {
-    fn open(index: u32) -> Option<Slot> {
-        let name = wide(&format!("Local\\heavy-gate-slot-{index}"));
-        let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
-        if handle.is_null() {
-            return None;
-        }
-        Some(Slot { index, handle })
-    }
-
-    /// Takes the slot without waiting. An abandoned mutex (dead holder) counts as taken.
-    fn try_take(&self) -> bool {
-        let r = unsafe { WaitForSingleObject(self.handle, 0) };
-        r == WAIT_OBJECT_0 || r == WAIT_ABANDONED
-    }
-
-    fn release(&self) {
-        unsafe { ReleaseMutex(self.handle) };
-    }
-}
-
-impl Drop for Slot {
-    fn drop(&mut self) {
-        unsafe { CloseHandle(self.handle) };
-    }
+fn meets_floor(cfg: &Config, bytes: Option<u64>) -> bool {
+    bytes.is_none_or(|b| b as f64 / GIB >= cfg.min_free_gb)
 }
 
 fn slot_file(cfg: &Config, index: u32) -> PathBuf {
     cfg.state_dir.join(format!("slot-{index}.json"))
 }
 
+fn holder_detail(cfg: &Config, index: u32) -> String {
+    let holder = std::fs::read_to_string(slot_file(cfg, index))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let Some(holder) = holder else {
+        return "holder unknown".into();
+    };
+    let age = now_unix().saturating_sub(holder["started"].as_u64().unwrap_or(now_unix()));
+    format!(
+        "pid {} label {:?} cwd {:?} age {}m{:02}s",
+        holder["pid"],
+        holder["label"].as_str().unwrap_or("?"),
+        holder["cwd"].as_str().unwrap_or("?"),
+        age / 60,
+        age % 60
+    )
+}
+
 fn describe_holders(cfg: &Config) -> String {
-    let mut parts = Vec::new();
-    for i in 0..cfg.slots {
-        if let Ok(text) = std::fs::read_to_string(slot_file(cfg, i)) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                let age = now_unix().saturating_sub(v["started"].as_u64().unwrap_or(0));
-                parts.push(format!(
-                    "pid {} `{}` {}m{:02}s",
-                    v["pid"],
-                    v["label"].as_str().unwrap_or("?"),
-                    age / 60,
-                    age % 60
-                ));
+    (0..cfg.slots)
+        .filter_map(|index| {
+            let mut slot = Slot::open(index, &cfg.state_dir)?;
+            if slot.try_take() {
+                return None;
             }
-        }
+            Some(format!("slot {index}: {}", holder_detail(cfg, index)))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn private_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
-    if parts.is_empty() { "holders unknown".into() } else { parts.join("; ") }
+    options
 }
 
 fn log_event(cfg: &Config, event: serde_json::Value) {
-    // One write per record: `writeln!` on an unbuffered file writes each piece separately, and records of runs
-    // that ended together were spliced into each other (runs.jsonl lines 6703-6704, 2026-10-14). An append of
-    // a single write lands whole.
-    let line = format!("{event}\n");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(cfg.state_dir.join("runs.jsonl"))
-    {
-        let _ = f.write_all(line.as_bytes());
+    let result = (|| -> io::Result<()> {
+        // Reserved outside the configurable slot range, with the same kernel lifetime rules.
+        // Serialize append writes, including short writes, across independent wrappers.
+        let mut lock = Slot::open(u32::MAX, &cfg.state_dir)
+            .ok_or_else(|| io::Error::other("cannot open run-log lock"))?;
+        let start = Instant::now();
+        while !lock.try_take() {
+            if start.elapsed() >= Duration::from_secs(2) {
+                return Err(io::Error::other("run-log lock busy"));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let line = format!("{event}\n");
+        private_options()
+            .create(true)
+            .append(true)
+            .open(cfg.state_dir.join("runs.jsonl"))?
+            .write_all(line.as_bytes())
+    })();
+    if let Err(e) = result {
+        eprintln!("heavy-gate: warning: cannot append run log: {e}");
     }
 }
 
-/// Waits for a free slot while enough memory is available, then returns the held slot.
-fn acquire(cfg: &Config, label: &str, max_wait: Duration) -> Result<Slot, String> {
-    let slots: Vec<Slot> = (0..cfg.slots).filter_map(Slot::open).collect();
-    if slots.is_empty() {
-        return Err("could not open any gate slot mutex".into());
+struct AdmissionError {
+    code: i32,
+    reason: String,
+}
+
+fn acquire(
+    cfg: &Config,
+    label: &str,
+    max_wait: Duration,
+    signals: &Signals,
+) -> Result<Slot, AdmissionError> {
+    let mut slots: Vec<Slot> = (0..cfg.slots)
+        .filter_map(|i| Slot::open(i, &cfg.state_dir))
+        .collect();
+    if slots.len() != cfg.slots as usize {
+        return Err(AdmissionError {
+            code: 1,
+            reason:
+                "cannot open all gate slots; check state-directory permissions and OS resources"
+                    .into(),
+        });
     }
     let start = Instant::now();
     let mut last_report: Option<Instant> = None;
     loop {
-        let free = available_gb();
-        let mut reason = String::new();
-        if free >= cfg.min_free_gb {
-            let mut taken = None;
-            for (pos, slot) in slots.iter().enumerate() {
-                if slot.try_take() {
-                    taken = Some(pos);
-                    break;
-                }
-            }
-            if let Some(pos) = taken {
-                // Re-check memory now that we hold the slot: another run may have just started.
-                if available_gb() >= cfg.min_free_gb {
-                    let mut slots = slots;
+        if let Some(signal) = signals.pending() {
+            return Err(AdmissionError {
+                code: 128 + signal,
+                reason: format!(
+                    "admission interrupted by signal {signal}; command was not started"
+                ),
+            });
+        }
+        let free = available();
+        let reason = if meets_floor(cfg, free) {
+            if let Some(pos) = slots.iter_mut().position(Slot::try_take) {
+                let rechecked = available();
+                if meets_floor(cfg, rechecked) {
                     return Ok(slots.swap_remove(pos));
                 }
                 slots[pos].release();
-                reason = format!("only {:.1} GB RAM available (floor {} GB)", available_gb(), cfg.min_free_gb);
+                memory_reason(cfg, rechecked)
             } else {
-                reason = format!("all {} slots busy ({})", cfg.slots, describe_holders(cfg));
+                format!("all {} slots busy ({})", cfg.slots, describe_holders(cfg))
             }
-        }
-        if reason.is_empty() {
-            reason = format!("only {free:.1} GB RAM available (floor {} GB)", cfg.min_free_gb);
-        }
+        } else {
+            memory_reason(cfg, free)
+        };
         if start.elapsed() >= max_wait {
-            return Err(format!(
-                "gave up after {}s waiting: {reason}. Retry later or run it with run_in_background.",
-                start.elapsed().as_secs()
-            ));
+            return Err(AdmissionError {
+                code: EXIT_GATE_TIMEOUT,
+                reason: format!(
+                    "gave up after {}s waiting: {reason}",
+                    start.elapsed().as_secs()
+                ),
+            });
         }
-        if last_report.map_or(true, |t| t.elapsed() >= REPORT_EVERY) {
-            eprintln!("heavy-gate: waiting to run `{label}`: {reason}");
+        if last_report.is_none_or(|t| t.elapsed() >= REPORT_EVERY) {
+            eprintln!("heavy-gate: waiting to run {label:?}: {reason}");
             last_report = Some(Instant::now());
         }
-        std::thread::sleep(POLL);
+        let pause = POLL.min(max_wait.saturating_sub(start.elapsed()));
+        let sleep_start = Instant::now();
+        while sleep_start.elapsed() < pause {
+            if let Some(signal) = signals.pending() {
+                return Err(AdmissionError {
+                    code: 128 + signal,
+                    reason: format!(
+                        "admission interrupted by signal {signal}; command was not started"
+                    ),
+                });
+            }
+            std::thread::sleep(
+                Duration::from_millis(50).min(pause.saturating_sub(sleep_start.elapsed())),
+            );
+        }
     }
 }
 
-fn kill_on_close_job() -> Option<HANDLE> {
-    unsafe {
-        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-        if job.is_null() {
-            return None;
-        }
-        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let ok = SetInformationJobObject(
-            job,
-            JobObjectExtendedLimitInformation,
-            &info as *const _ as *const c_void,
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        );
-        if ok == 0 {
-            CloseHandle(job);
-            return None;
-        }
-        Some(job)
-    }
+fn memory_reason(cfg: &Config, bytes: Option<u64>) -> String {
+    format!(
+        "only {:.1} GiB RAM available (floor {} GiB)",
+        bytes.unwrap_or(0) as f64 / GIB,
+        cfg.min_free_gb
+    )
 }
 
 pub struct RunOptions {
@@ -187,57 +203,55 @@ pub struct RunOptions {
     pub args: Vec<String>,
 }
 
-/// Resolves a bare program name the way a shell would, so `npm` finds `npm.cmd`
-/// (std's Command only finds `.exe` on its own).
-fn resolve_program(program: &str) -> PathBuf {
-    let given = PathBuf::from(program);
-    if given.extension().is_some() && (given.is_file() || given.components().count() > 1) {
-        return given;
-    }
-    let exts: Vec<String> = std::env::var("PATHEXT")
-        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
-        .split(';')
-        .filter(|e| !e.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect();
-    let dirs: Vec<PathBuf> = if given.components().count() > 1 {
-        vec![PathBuf::new()]
-    } else {
-        std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default()
-    };
-    for dir in dirs {
-        for ext in &exts {
-            let candidate = dir.join(format!("{program}{ext}"));
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
-    }
-    given
-}
-
 pub fn run(cfg: &Config, opts: RunOptions) -> i32 {
-    let _ = std::fs::create_dir_all(&cfg.state_dir);
+    if let Err(e) = create_state_dir(&cfg.state_dir) {
+        eprintln!(
+            "heavy-gate: cannot create state directory {}: {e}",
+            cfg.state_dir.display()
+        );
+        return 1;
+    }
+    let signals = match Signals::new() {
+        Ok(signals) => signals,
+        Err(e) => {
+            eprintln!("heavy-gate: cannot install signal handlers: {e}");
+            return 1;
+        }
+    };
     let wait_start = Instant::now();
-    let slot = match acquire(cfg, &opts.label, opts.max_wait) {
+    let mut slot = match acquire(cfg, &opts.label, opts.max_wait, &signals) {
         Ok(slot) => slot,
-        Err(msg) => {
-            eprintln!("heavy-gate: {msg}");
-            log_event(cfg, serde_json::json!({"ts": now_unix(), "event": "timeout", "label": opts.label,
-                "waited_s": wait_start.elapsed().as_secs()}));
-            return EXIT_GATE_TIMEOUT;
+        Err(e) => {
+            eprintln!("heavy-gate: {}", e.reason);
+            log_event(
+                cfg,
+                serde_json::json!({"ts": now_unix(),
+                "event": if e.code == EXIT_GATE_TIMEOUT { "timeout" } else { "admission_error" },
+                "label": opts.label, "pid": std::process::id(), "exit": e.code,
+                "waited_s": wait_start.elapsed().as_secs()}),
+            );
+            return e.code;
         }
     };
     let waited = wait_start.elapsed().as_secs();
     if waited >= 2 {
         eprintln!("heavy-gate: slot {} acquired after {waited}s", slot.index);
     }
-    let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     let holder = serde_json::json!({"slot": slot.index, "pid": std::process::id(), "label": opts.label,
         "cwd": cwd, "started": now_unix()});
-    let _ = std::fs::write(slot_file(cfg, slot.index), holder.to_string());
-
-    let mut cmd = Command::new(resolve_program(&opts.program));
+    if let Err(e) = private_options()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(slot_file(cfg, slot.index))
+        .and_then(|mut f| f.write_all(holder.to_string().as_bytes()))
+    {
+        eprintln!("heavy-gate: warning: cannot write holder metadata: {e}");
+    }
+    let mut cmd = platform::command(&opts.program);
     cmd.args(&opts.args);
     if opts.set_jobs_env {
         let jobs = cfg.jobs.to_string();
@@ -248,52 +262,64 @@ pub fn run(cfg: &Config, opts: RunOptions) -> i32 {
         }
     }
     let run_start = Instant::now();
-    let code = match cmd.spawn() {
-        Ok(mut child) => {
-            let job = kill_on_close_job();
-            if let Some(job) = job {
-                use std::os::windows::io::AsRawHandle;
-                unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) };
+    let code = if let Some(signal) = signals.pending() {
+        128 + signal
+    } else {
+        match platform::run_child(cmd, &signals) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("heavy-gate: could not start {:?}: {e}", opts.program);
+                127
             }
-            let code = match child.wait() {
-                Ok(status) => status.code().unwrap_or(1),
-                Err(e) => {
-                    eprintln!("heavy-gate: wait failed: {e}");
-                    1
-                }
-            };
-            if let Some(job) = job {
-                unsafe { CloseHandle(job) };
-            }
-            code
-        }
-        Err(e) => {
-            eprintln!("heavy-gate: could not start `{}`: {e}", opts.program);
-            127
         }
     };
+    // Remove metadata before unlocking so an exiting holder cannot erase its successor.
     let _ = std::fs::remove_file(slot_file(cfg, slot.index));
     slot.release();
-    log_event(cfg, serde_json::json!({"ts": now_unix(), "event": "run", "label": opts.label, "cwd": cwd,
-        "slot": slot.index, "waited_s": waited, "ran_s": run_start.elapsed().as_secs(), "exit": code}));
+    log_event(
+        cfg,
+        serde_json::json!({"ts": now_unix(), "event": "run", "label": opts.label, "cwd": cwd,
+        "pid": std::process::id(), "slot": slot.index, "waited_s": waited,
+        "ran_s": run_start.elapsed().as_secs(), "exit": code}),
+    );
     code
 }
 
 pub fn status(cfg: &Config) -> i32 {
-    println!("heavy-gate: {} slots, floor {} GB, jobs {}, {:.1} GB RAM available now",
-        cfg.slots, cfg.min_free_gb, cfg.jobs, available_gb());
-    for i in 0..cfg.slots {
-        let Some(slot) = Slot::open(i) else {
-            println!("  slot {i}: cannot open");
+    if let Err(e) = create_state_dir(&cfg.state_dir) {
+        eprintln!(
+            "heavy-gate: cannot open state directory {}: {e}",
+            cfg.state_dir.display()
+        );
+        return 1;
+    }
+    let memory = |bytes: Option<u64>| {
+        bytes.map_or_else(
+            || "unknown".into(),
+            |b| format!("{:.1} GiB", b as f64 / GIB),
+        )
+    };
+    println!(
+        "heavy-gate: {} slots, floor {} GiB, jobs {}",
+        cfg.slots, cfg.min_free_gb, cfg.jobs
+    );
+    println!(
+        "memory: {} available / {} total",
+        memory(available()),
+        memory(platform::total_memory_bytes())
+    );
+    let mut code = 0;
+    for index in 0..cfg.slots {
+        let Some(mut slot) = Slot::open(index, &cfg.state_dir) else {
+            println!("  slot {index}: cannot open");
+            code = 1;
             continue;
         };
         if slot.try_take() {
-            slot.release();
-            println!("  slot {i}: free");
+            println!("  slot {index}: free");
         } else {
-            let detail = std::fs::read_to_string(slot_file(cfg, i)).unwrap_or_else(|_| "{}".into());
-            println!("  slot {i}: busy {detail}");
+            println!("  slot {index}: busy {}", holder_detail(cfg, index));
         }
     }
-    0
+    code
 }

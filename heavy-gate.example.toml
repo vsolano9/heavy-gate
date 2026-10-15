@@ -1,0 +1,37 @@
+# heavy-gate user configuration.
+# Run `heavy config` to see effective values and paths; `heavy init` creates
+# the default file and refuses to overwrite an existing one.
+# HEAVY_GATE_CONFIG can select a different configuration file.
+# Omit an override to keep the automatically derived value.
+
+# Concurrent commands: clamp(floor(physical RAM in GiB / 10), 1, 4).
+# slots = 2
+
+# Admission floor in GiB: max(2, round(physical RAM in GiB * 0.15)).
+# This does not reserve memory or cap running commands.
+# min_free_gb = 4
+
+# Cargo/CMake jobs: max(1, logical CPU count / effective slots).
+# Existing CARGO_BUILD_JOBS and CMAKE_BUILD_PARALLEL_LEVEL are preserved.
+# jobs = 4
+
+# Maximum admission wait, in seconds. `run --max-wait` overrides one run.
+max_wait_secs = 3600
+
+# Normally use the platform's user state directory shown by `heavy config`.
+# On Unix all cooperating sessions must use the same state directory.
+# Use a full path if overriding it; do not rely on shell expansion in TOML.
+# state_dir = "/absolute/path/to/heavy-gate-state"
+
+# Hook policy: "deny" rejects subagent builds, including wrapped builds.
+# "gate" permits them only when wrapped with `heavy run`.
+subagent_builds = "deny"
+
+[hook]
+# Plain executable names only, not paths, shell fragments, or regexes.
+# Build entries are also subject to the subagent policy.
+extra_build_programs = []
+extra_heavy_programs = []
+
+# Passing hook checks does not disable direct `heavy run` admission gating.
+disabled = false

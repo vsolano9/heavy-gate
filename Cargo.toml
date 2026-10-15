@@ -2,9 +2,13 @@
 name = "heavy-gate"
 version = "1.0.0"
 edition = "2021"
-description = "Machine-wide gate for heavy commands (builds, compiles, renders) shared by every agent session on one machine"
+rust-version = "1.85"
+description = "Coordinate build admission across agent sessions with shared slots and a free-memory floor"
 license = "MIT"
 repository = "https://github.com/vsolano9/heavy-gate"
+readme = "README.md"
+keywords = ["build", "agents", "claude-code", "memory", "queue"]
+categories = ["command-line-utilities", "development-tools::build-utils"]
 publish = false
 
 [[bin]]
@@ -13,9 +17,15 @@ path = "src/main.rs"
 
 [dependencies]
 regex = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 
-[dependencies.windows-sys]
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+signal-hook = "0.3"
+
+[target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.59"
 features = [
     "Win32_Foundation",
