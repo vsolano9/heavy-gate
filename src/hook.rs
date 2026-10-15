@@ -15,7 +15,7 @@ use std::io::Read;
 
 /// Start of a command, plus PowerShell `&`, `cmd /c`, bash `VAR=x`, `env`/`time` prefixes and shell
 /// keywords that begin a command (`then`, `do`, `if`, ...), which count only after a separator.
-const START: &str = r#"(?:^|[\n;|&({])\s*(?:&\s*)?(?:(?:then|do|else|elif|if|while|until|!|cmd(?:\.exe)?\s+//?[ck]|time|env|nice|start(?:\s+/\w+)*)\s+)*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;|&(){}]*\s+)*(?:['"][^'"\n]*[\\/]|['"]?(?:[^\s'";|&(){}]*[\\/])?)"#;
+const START: &str = r#"(?:^|[\n;|&({])\s*(?:&\s*)?(?:(?:then|do|else|elif|if|while|until|!|cmd(?:\.exe)?\s+//?[ck]|time|env|nice|start(?:\s+/\w+)*|[A-Za-z_][A-Za-z0-9_]*=[^\s;|&(){}]*)\s+)*(?:['"][^'"\n]*[\\/]|['"]?(?:[^\s'";|&(){}]*[\\/])?)"#;
 /// End of a program name: optional Windows extension, optional closing quote, then a separator.
 const END: &str = r#"(?:\.exe|\.cmd|\.bat)?['"]?(?:\s|$|[;|&)}])"#;
 
@@ -379,7 +379,11 @@ fn command_span(command: &str, found: &str) -> String {
             break;
         }
     }
-    text[start..end].trim().to_string()
+    // Control keywords (`then make`) are shell syntax, not part of the blocked command.
+    let keywords =
+        Regex::new(r"^(?:(?:then|do|else|elif|if|while|until|!)\s+)+").expect("keyword regex");
+    let span = text[start..end].trim();
+    keywords.replace(span, "").into_owned()
 }
 
 /// `heavy run --` placed after shell prefixes (`VAR=x`, `time`, `cmd /c`, `then`, ...) and with an

@@ -479,6 +479,13 @@ cargo build",
             true,
         ),
         (
+            "env assignment before time",
+            "X=1 time cargo build -j2",
+            false,
+            false,
+            true,
+        ),
+        (
             "loop body build",
             "for f in a; do make; done",
             false,
@@ -579,6 +586,12 @@ fn deny_names_the_exact_wrapped_command() {
             "bash -c 'cargo build --locked'",
             false,
             "heavy run -- cargo build --locked",
+        ),
+        ("if true; then make all; fi", false, "heavy run -- make all"),
+        (
+            "X=1 time cargo build -j2",
+            false,
+            "X=1 time heavy run -- cargo build -j2",
         ),
     ] {
         let Verdict::Deny(reason) = judge(&cfg, command, false, powershell) else {
