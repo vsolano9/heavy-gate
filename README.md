@@ -110,13 +110,24 @@ heavy run -- python build.py
 
 ## How it works
 
+```mermaid
+flowchart LR
+    start(["heavy run -- COMMAND"]) --> admit{"Memory at or above the floor<br/>and a slot free?<br/>(memory rechecked after<br/>taking the slot)"}
+    admit -- yes --> child["Run COMMAND in the slot<br/>(job object or<br/>signal forwarding)"]
+    child --> done(["Release the slot, log the run,<br/>exit with the command's code"])
+    admit -- no --> wait["Wait and retry,<br/>reporting why"]
+    wait -- "max_wait_secs reached" --> gaveup(["Exit 75,<br/>command not started"])
+    wait -- "interrupted" --> interrupted(["Exit 128 + signal,<br/>command not started"])
+    wait -- "retry" --> admit
+```
+
 Each `heavy run` waits for both a shared slot and enough available memory, rechecks memory after taking the slot, and holds the slot until the child exits. Waiters periodically retry and report why they are waiting. There is no daemon, persistent queue, or FIFO ordering guarantee.
 
 Windows uses `Local` named mutexes whose names include a hash of the canonical state directory, so different spellings of one directory (relative paths, junctions, short names) share one gate. Unix uses `flock` locks in the state directory. Kernel locks are released when their owning process exits, including after a crash. Metadata files describe holders; they are not the lock authority. All cooperating sessions should use the same slot count and the same state directory.
 
 By default, `heavy` sets `CARGO_BUILD_JOBS` and `CMAKE_BUILD_PARALLEL_LEVEL` for the child only when each variable is unset. `--no-jobs-env` disables this. Other build tools need their own parallelism settings.
 
-On Windows, the wrapper attempts to join a [kill-on-close Job Object](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects) before starting the child so children inherit membership. If that is unavailable, it warns and attempts to assign the child after spawning. That fallback has an assignment race and host Job Object restrictions can prevent containment. On Unix, the child remains in the wrapper's process group and the wrapper forwards `SIGINT`, `SIGTERM`, and `SIGHUP` to the child. Linux additionally gives the direct child a [parent-death `SIGKILL`](https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html). On Windows, Ctrl+C or Ctrl+Break reaches the child through the shared console, and the wrapper itself stays alive to record the run; Ctrl+C while still waiting for admission ends the wait with exit 130, as `SIGINT` does on Unix.
+On Windows, the wrapper joins a [kill-on-close Job Object](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects) before starting the child so children inherit membership. Where the host forbids that, it starts the child suspended, assigns it to the job, and only then lets it run, so no descendant can start outside the job. If the job cannot be created or the child cannot be assigned, the command is not run and `heavy` exits 127. On Unix, the child remains in the wrapper's process group and the wrapper forwards `SIGINT`, `SIGTERM`, and `SIGHUP` to the child. Linux additionally gives the direct child a [parent-death `SIGKILL`](https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html). On Windows, Ctrl+C or Ctrl+Break reaches the child through the shared console, and the wrapper itself stays alive to record the run; Ctrl+C while still waiting for admission ends the wait with exit 130, as `SIGINT` does on Unix.
 
 ## Commands and exit codes
 
@@ -148,7 +159,7 @@ Place `run` options before the program. `--` ends option parsing. `--max-wait` l
 | Child's exit code | The child started and exited normally. |
 | `128 + signal` | On Unix, the child terminated by a signal, or the wrapper got `SIGINT`, `SIGTERM`, or `SIGHUP` while waiting for admission and never started it. On Windows, Ctrl+C while waiting returns 130. |
 | `75` | Admission timed out. |
-| `127` | The child could not be started. |
+| `127` | The child could not be started, or on Windows could not be placed in its cleanup job. |
 | `2` | Invalid CLI usage. |
 | `1` | A state, slot, signal-handler, initialization, or child-wait operation failed. `config` also returns 1 when the file has problems. |
 
@@ -299,7 +310,7 @@ Labels and working directories can contain private information. Logs stay local,
 
 **How is available memory measured?** Windows uses `GlobalMemoryStatusEx` available physical memory. Linux reads `/proc/meminfo` `MemAvailable`, falling back to `MemFree + Buffers + Cached` if absent; total memory is `MemTotal`. macOS reads `hw.memsize` and multiplies it by the kernel's `kern.memorystatus_level` percentage. The macOS value is a system availability estimate rather than an exact reclaimable-byte count. If the available-memory query fails, the floor is treated as satisfied with one warning to stderr per invocation. `status` shows unknown for unavailable readings.
 
-**What happens when the wrapper dies?** Its slot lock is released. Windows Job Object containment attempts to terminate contained descendants. On Windows the job also ends descendants that are still running when the wrapper exits normally, so a build daemon meant to outlive the build (a Gradle daemon, an sccache server) should be started outside `heavy run`. Linux's parent-death signal covers the direct child. Unix descendants can outlive the wrapper or escape the original process group, especially after abrupt termination; their work can continue after the slot becomes free. Unix signal forwarding is not full process-tree containment.
+**What happens when the wrapper dies?** Its slot lock is released. The Windows Job Object terminates its descendants. On Windows the job also ends descendants that are still running when the wrapper exits normally, so a build daemon meant to outlive the build (a Gradle daemon, an sccache server) should be started outside `heavy run`. Linux's parent-death signal covers the direct child. Unix descendants can outlive the wrapper or escape the original process group, especially after abrupt termination; their work can continue after the slot becomes free. Unix signal forwarding is not full process-tree containment.
 
 **Is the hook a security boundary?** No. It uses command heuristics, can miss indirect or unusual invocations, and fails open on malformed hook input. It only sees configured Bash and PowerShell tool events. Direct wrappers provide coordination for commands that actually use them; use OS isolation and tool permissions for enforcement against untrusted commands.
 

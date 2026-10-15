@@ -6,7 +6,7 @@
 
 The gate coordinates cooperating callers. It is not a sandbox, memory quota, access-control boundary, or protection against hostile processes. The memory floor is checked at admission; running commands can subsequently exhaust memory. The Claude Code hook is heuristic and deliberately fails open on unusable hook input; configuration errors fall back to defaults for the affected keys.
 
-Windows Job Object containment is best effort when the host restricts job membership. Unix processes can outlive the wrapper; Linux parent-death signaling covers the direct child. Use operating-system resource limits and isolation when stronger guarantees are needed.
+On Windows a command runs only inside a kill-on-close Job Object; if the host prevents that, the command is refused. Unix processes can outlive the wrapper; Linux parent-death signaling covers the direct child. Use operating-system resource limits and isolation when stronger guarantees are needed.
 
 ## Local data
 

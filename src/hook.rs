@@ -13,8 +13,9 @@ use crate::config::Config;
 use regex::Regex;
 use std::io::Read;
 
-/// Start of a command, plus PowerShell `&`, `cmd /c`, bash `VAR=x` and `env`/`time` prefixes.
-const START: &str = r#"(?:^|[\n;|&({]|\b(?:then|do|else)\b)\s*(?:&\s*)?(?:(?:cmd(?:\.exe)?\s+//?[ck]|time|env|nice|start(?:\s+/\w+)*)\s+)*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;|&(){}]*\s+)*(?:['"][^'"\n]*[\\/]|['"]?(?:[^\s'";|&(){}]*[\\/])?)"#;
+/// Start of a command, plus PowerShell `&`, `cmd /c`, bash `VAR=x`, `env`/`time` prefixes and shell
+/// keywords that begin a command (`then`, `do`, `if`, ...), which count only after a separator.
+const START: &str = r#"(?:^|[\n;|&({])\s*(?:&\s*)?(?:(?:then|do|else|elif|if|while|until|!|cmd(?:\.exe)?\s+//?[ck]|time|env|nice|start(?:\s+/\w+)*)\s+)*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;|&(){}]*\s+)*(?:['"][^'"\n]*[\\/]|['"]?(?:[^\s'";|&(){}]*[\\/])?)"#;
 /// End of a program name: optional Windows extension, optional closing quote, then a separator.
 const END: &str = r#"(?:\.exe|\.cmd|\.bat)?['"]?(?:\s|$|[;|&)}])"#;
 
@@ -82,7 +83,7 @@ fn gate_prefix() -> Regex {
 
 /// Where a wrapped target that starts at `start` ends: the first separator outside quotes and
 /// nesting, or the end of the text with nesting balanced. `None` when nesting never closes.
-fn target_end(command: &str, start: usize, brackets: bool) -> Option<usize> {
+fn target_end(command: &str, start: usize, brackets: bool, powershell: bool) -> Option<usize> {
     let mut depth = 0_u32;
     let mut quote = None;
     for (offset, ch) in command[start..].char_indices() {
@@ -96,8 +97,10 @@ fn target_end(command: &str, start: usize, brackets: bool) -> Option<usize> {
             quote = Some(ch);
             continue;
         }
-        let opens = ch == '\u{1e}' || (brackets && (ch == '(' || ch == '{'));
-        let closes = ch == '\u{1f}' || (brackets && (ch == ')' || ch == '}'));
+        // Braces group commands only in PowerShell script blocks; in Bash an argument brace is
+        // literal (`echo { ; make` runs make outside the wrapper).
+        let opens = ch == '\u{1e}' || (brackets && (ch == '(' || (powershell && ch == '{')));
+        let closes = ch == '\u{1f}' || (brackets && (ch == ')' || (powershell && ch == '}')));
         if opens {
             depth += 1;
         } else if closes && depth > 0 {
@@ -109,7 +112,7 @@ fn target_end(command: &str, start: usize, brackets: bool) -> Option<usize> {
     (depth == 0).then_some(command.len())
 }
 
-fn gated_targets(command: &str) -> (Vec<String>, String) {
+fn gated_targets(command: &str, powershell: bool) -> (Vec<String>, String) {
     let re = gate_prefix();
     let mut targets = Vec::new();
     let mut outside = String::new();
@@ -117,8 +120,9 @@ fn gated_targets(command: &str) -> (Vec<String>, String) {
     while let Some(m) = re.find_at(command, from) {
         // An unbalanced bracket would otherwise extend the target to the end of the line and
         // bless whatever follows; then only the internal markers count as nesting.
-        let end = target_end(command, m.end(), true)
-            .unwrap_or_else(|| target_end(command, m.end(), false).unwrap_or(command.len()));
+        let end = target_end(command, m.end(), true, powershell).unwrap_or_else(|| {
+            target_end(command, m.end(), false, powershell).unwrap_or(command.len())
+        });
         outside.push_str(&command[from..m.start()]);
         outside.push_str("; ");
         targets.push(command[m.end()..end].to_string());
@@ -299,13 +303,14 @@ pub fn judge(cfg: &Config, command: &str, is_subagent: bool, powershell: bool) -
         // Too large to parse: deny if a build appears anywhere rather than pass it unseen.
         return match first_run(&build_re, command) {
             Some(found) => Verdict::Deny(format!(
-                "Machine-wide memory rule: this command is too large for the hook to classify and contains                  `{found}`. Run the heavy part as its own command, prefixed by `heavy run -- `."
+                "Machine-wide memory rule: this command is too large for the hook to classify and \
+                 contains `{found}`. Run the heavy part as its own command, prefixed by `heavy run -- `."
             )),
             None => Verdict::Pass,
         };
     }
     let visible = mask_data(command, powershell);
-    let (targets, outside) = gated_targets(&visible);
+    let (targets, outside) = gated_targets(&visible, powershell);
     let build = first_run(&build_re, &outside);
     let heavy = first_run(
         &compile(HEAVY_PROGRAMS, &cfg.hook.extra_heavy_programs),
@@ -315,7 +320,7 @@ pub fn judge(cfg: &Config, command: &str, is_subagent: bool, powershell: bool) -
 
     if is_subagent && cfg.subagent_builds == "deny" && (build.is_some() || wrapped_build.is_some())
     {
-        let what = build.or(wrapped_build).unwrap_or_default();
+        let what = command_span(command, &build.or(wrapped_build).unwrap_or_default());
         return Verdict::Deny(format!(
             "The configured policy is that subagents do not build, compile, or run test builds. \
              Blocked: `{what}`. Finish your edits and hand the exact command back to the lead, \
@@ -325,28 +330,83 @@ pub fn judge(cfg: &Config, command: &str, is_subagent: bool, powershell: bool) -
     if build.is_none() && heavy.is_none() {
         return Verdict::Pass;
     }
-    let what = build.or(heavy).unwrap_or_default();
+    let what = command_span(command, &build.or(heavy).unwrap_or_default());
+    let wrapped = wrapped_form(&what);
     let heavy_path = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "heavy".into());
-    // `heavy run` starts programs, not scripts: name the interpreter for anything but .cmd/.bat.
-    let lower = what.to_ascii_lowercase();
-    let is_script = [".ps1", ".sh", ".py"]
-        .iter()
-        .any(|ext| lower.trim_end_matches(['\'', '"']).ends_with(ext));
-    let script_hint = if is_script {
-        " A script runs through its interpreter, for example \
-             `heavy run -- pwsh -NoProfile -File ./build.ps1` or `heavy run -- sh ./build.sh`."
+    Verdict::Deny(format!(
+        "Machine-wide memory rule: heavy commands (builds, compiles, Blender, video renders) run through the shared \
+         gate so parallel sessions cannot exhaust RAM. Blocked: `{what}`. Rerun it as `{wrapped}`, leaving the rest \
+         of the command line as it was (executable path if `heavy` is not on PATH: {heavy_path:?}). \
+         The gate may wait when the machine is busy; `heavy status` shows slots and memory."
+    ))
+}
+
+/// The whole simple command around a match, with its arguments and quoting, from the original
+/// text: from the match to the next unquoted separator, or to a quote that closes an enclosing
+/// shell body. Falls back to the match itself when it is not found verbatim.
+fn command_span(command: &str, found: &str) -> String {
+    let text = command.replace("\r\n", "\n");
+    let Some(start) = text.find(found) else {
+        return found.to_string();
+    };
+    let mut quote = None;
+    let mut end = text.len();
+    for (offset, ch) in text[start..].char_indices() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        if offset >= found.len() && (ch == '\'' || ch == '"') {
+            // A quote opened inside the span is an argument; one that closes the enclosing body
+            // ends the span. Look ahead for its partner on the same line.
+            let partner = text[start + offset + 1..]
+                .split('\n')
+                .next()
+                .is_some_and(|rest| rest.contains(ch));
+            if !partner {
+                end = start + offset;
+                break;
+            }
+            quote = Some(ch);
+            continue;
+        }
+        if offset >= found.len() && matches!(ch, '\n' | ';' | '|' | '&' | ')' | '}') {
+            end = start + offset;
+            break;
+        }
+    }
+    text[start..end].trim().to_string()
+}
+
+/// `heavy run --` placed after shell prefixes (`VAR=x`, `time`, `cmd /c`, `then`, ...) and with an
+/// interpreter in front of scripts that cannot be started directly.
+fn wrapped_form(span: &str) -> String {
+    let prefix = Regex::new(
+        r#"(?i)^\s*(?:&\s*)?(?:(?:then|do|else|elif|if|while|until|!|cmd(?:\.exe)?\s+//?[ck]|time|env|nice|start(?:\s+/\w+)*|[A-Za-z_][A-Za-z0-9_]*=[^\s;|&(){}]*)\s+)*"#,
+    )
+    .expect("prefix regex");
+    let cut = prefix.find(span).map_or(0, |m| m.end());
+    let head = span[..cut]
+        .trim_start()
+        .trim_start_matches('&')
+        .trim_start();
+    let rest = &span[cut..];
+    let program = rest.split_whitespace().next().unwrap_or("");
+    let lower = program.trim_matches(['\'', '"']).to_ascii_lowercase();
+    let interpreter = if lower.ends_with(".ps1") {
+        "pwsh -NoProfile -File "
+    } else if lower.ends_with(".sh") {
+        "sh "
+    } else if lower.ends_with(".py") {
+        "python "
     } else {
         ""
     };
-    Verdict::Deny(format!(
-        "Machine-wide memory rule: heavy commands (builds, compiles, Blender, video renders) run through the shared \
-         gate so parallel sessions cannot exhaust RAM. Blocked: `{what}`. Rerun the same command with only the heavy \
-         part prefixed by `heavy run -- `, for example `heavy run -- cargo build --release` or \
-         `cd app && heavy run -- npm run build` (executable path if `heavy` is not on PATH: {heavy_path:?}). \
-         The gate may wait when the machine is busy; `heavy status` shows slots and memory.{script_hint}"
-    ))
+    format!("{head}heavy run -- {interpreter}{rest}")
 }
 
 /// Reads the PreToolUse payload from stdin and prints a decision only when denying.

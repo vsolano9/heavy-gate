@@ -456,6 +456,49 @@ cargo build",
             false,
             false,
         ),
+        (
+            "literal braces around unwrapped build",
+            "heavy run -- echo { ; make all; echo }",
+            false,
+            false,
+            true,
+        ),
+        ("do as echo data", "echo do make all", false, false, false),
+        (
+            "then as echo data",
+            "echo then make all",
+            false,
+            false,
+            false,
+        ),
+        (
+            "if body build",
+            "if true; then make all; fi",
+            false,
+            false,
+            true,
+        ),
+        (
+            "loop body build",
+            "for f in a; do make; done",
+            false,
+            false,
+            true,
+        ),
+        (
+            "if condition build",
+            "if cargo build; then echo ok; fi",
+            false,
+            false,
+            true,
+        ),
+        (
+            "powershell script block in wrapped body",
+            "heavy run -- pwsh -NoProfile -Command { cargo build; cargo test }",
+            true,
+            false,
+            false,
+        ),
     ];
     let cfg = LoadedConfig::parse("unused.toml".into(), "").config;
     for (name, command, powershell, subagent, deny) in cases {
@@ -506,4 +549,44 @@ extra_heavy_programs = ['render-tool']
     ));
     cfg.hook.disabled = true;
     assert_eq!(judge(&cfg, "cargo build", true, false), Verdict::Pass);
+}
+
+#[test]
+fn deny_names_the_exact_wrapped_command() {
+    let cfg = LoadedConfig::parse("unused.toml".into(), "").config;
+    for (command, powershell, wrapped) in [
+        (
+            "cmake --build build --target release --parallel 4",
+            false,
+            "heavy run -- cmake --build build --target release --parallel 4",
+        ),
+        (
+            "cd app && npm run build -- --mode production",
+            false,
+            "heavy run -- npm run build -- --mode production",
+        ),
+        (
+            "FOO=1 cargo build --release",
+            false,
+            "FOO=1 heavy run -- cargo build --release",
+        ),
+        (
+            "& ./build.ps1 -Release",
+            true,
+            "heavy run -- pwsh -NoProfile -File ./build.ps1 -Release",
+        ),
+        (
+            "bash -c 'cargo build --locked'",
+            false,
+            "heavy run -- cargo build --locked",
+        ),
+    ] {
+        let Verdict::Deny(reason) = judge(&cfg, command, false, powershell) else {
+            panic!("{command}: expected a denial");
+        };
+        assert!(
+            reason.contains(&format!("`{wrapped}`")),
+            "{command}: {reason}"
+        );
+    }
 }
